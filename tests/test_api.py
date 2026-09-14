@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import json
 import string
 from typing import Any
 
@@ -607,3 +608,102 @@ def test_verify_and_correct_regression_after_explain_added() -> None:
     assert correct.status_code == 200
     assert correct.json()["status"] == "unique"
     assert correct.json()["candidates"][0]["container_number"] == "CSQU3054383"
+
+
+# ------------------------------------------------------- 未配对代理字符
+
+# 请求体 JSON 的 \uXXXX 转义可构造未配对代理字符（如首位为 \ud800 的
+# 11 位箱号）。它不属于 A-Z：批量校验与明细入口必须在位置 1 报
+# not_uppercase_letter；纠错入口照常生成候选。响应中的原样回显经
+# \uXXXX 转义传输，客户端用标准 JSON 解析即可无损还原。
+SURROGATE_FIRST_NUMBER = "\ud800SQU3054383"
+
+
+def _post_raw_json(url: str, payload: Any) -> Any:
+    """以原始 JSON 体 POST，可携带 \\uXXXX 转义的未配对代理字符。
+
+    httpx 的 ``json=`` 参数按 ``ensure_ascii=False`` 序列化，无法编码
+    未配对代理字符；标准库 ``json.dumps`` 默认转义非 ASCII 字符，
+    传输与解析两端均可无损还原。
+    """
+    return client.post(
+        url,
+        content=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+
+
+def test_verify_rejects_unpaired_surrogate_with_first_position_error() -> None:
+    # 首位含未配对代理字符的 11 位箱号：整批拒绝，报首位结构错误。
+    response = _post_raw_json(
+        VALID_ENDPOINT,
+        {"container_numbers": ["CSQU3054383", SURROGATE_FIRST_NUMBER]},
+    )
+    assert response.status_code == 422
+    body = response.json()
+    assert body["status"] == "invalid_batch"
+    assert body["count"] == 2
+    assert body["index"] == 1  # 最小非法索引
+    assert body["container_number"] == SURROGATE_FIRST_NUMBER  # 原样回显
+    assert body["error_code"] == "not_uppercase_letter"
+    assert body["position"] == 1
+    assert "results" not in body
+
+
+def test_explain_unpaired_surrogate_returns_first_position_error() -> None:
+    # 明细入口：同样返回首位结构错误，而不是中断响应。
+    response = _post_raw_json(
+        EXPLAIN_ENDPOINT, {"container_number": SURROGATE_FIRST_NUMBER}
+    )
+    assert response.status_code == 422
+    body = response.json()
+    assert body["status"] == "invalid_container"
+    assert body["container_number"] == SURROGATE_FIRST_NUMBER
+    assert body["error_code"] == "not_uppercase_letter"
+    assert body["position"] == 1
+    assert "steps" not in body
+
+
+def test_correct_unpaired_surrogate_returns_full_candidates() -> None:
+    # 纠错入口：合法候选完整返回，结论不被代理字符中断。
+    response = _post_raw_json(
+        CORRECT_ENDPOINT, {"container_number": SURROGATE_FIRST_NUMBER}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "multiple"
+    assert body["container_number"] == SURROGATE_FIRST_NUMBER
+    # 候选与测试侧独立汉明距离枚举完全一致（位置 1 候选的原字符即代理字符）。
+    assert body["candidates"] == _reference_corrections(SURROGATE_FIRST_NUMBER)
+    assert body["candidate_count"] == len(body["candidates"]) > 0
+    position_one = [c for c in body["candidates"] if c["position"] == 1]
+    assert position_one
+    assert all(c["original_character"] == "\ud800" for c in position_one)
+
+
+def test_unpaired_surrogate_variants_and_astral_character() -> None:
+    # 低代理字符同样按位置 1 结构错误拒绝。
+    low = _post_raw_json(EXPLAIN_ENDPOINT, {"container_number": "\udfffSQU3054383"})
+    assert low.status_code == 422
+    assert low.json()["error_code"] == "not_uppercase_letter"
+    assert low.json()["position"] == 1
+    assert low.json()["container_number"] == "\udfffSQU3054383"
+
+    # 合法码点（emoji，UTF-16 中为代理对）本就无需特殊处理，行为不变。
+    emoji = _post_raw_json(
+        EXPLAIN_ENDPOINT, {"container_number": "\U0001f600SQU3054383"}
+    )
+    assert emoji.status_code == 422
+    assert emoji.json()["error_code"] == "not_uppercase_letter"
+    assert emoji.json()["position"] == 1
+    assert emoji.json()["container_number"] == "\U0001f600SQU3054383"
+
+
+def test_request_shape_error_with_surrogate_input_still_returns_detail() -> None:
+    # 12 位（超长）触发请求形状校验；detail 会原样回显含代理字符的
+    # 输入，必须仍是 422 detail 形态，而不是在渲染错误时 500。
+    response = _post_raw_json(
+        CORRECT_ENDPOINT, {"container_number": SURROGATE_FIRST_NUMBER + "X"}
+    )
+    assert response.status_code == 422
+    assert "detail" in response.json()

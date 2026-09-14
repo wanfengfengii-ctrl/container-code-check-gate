@@ -11,9 +11,12 @@
 
 from __future__ import annotations
 
-from typing import Literal
+import json
+from typing import Any, Literal
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.checksum import (
@@ -39,6 +42,32 @@ from app.schemas import (
     VerifyResponse,
 )
 
+
+class SafeJSONResponse(JSONResponse):
+    """可安全渲染任意字符串内容的 JSON 响应。
+
+    请求体 JSON 里的 ``\\uXXXX`` 转义经解析后可产生**未配对代理字符**
+    （如首位为 ``\\ud800`` 的箱号）。按业务规则这类输入在响应中原样
+    回显，但默认渲染（``ensure_ascii=False`` 后按 UTF-8 编码）无法
+    编码未配对代理字符，会在响应阶段抛出 ``UnicodeEncodeError``，
+    使本可正常作答的请求以 500 中断。
+
+    这里改用 ``ensure_ascii=True``：非 ASCII 字符（含未配对代理字符）
+    一律转义为 ``\\uXXXX`` 字面量，输出恒为 ASCII，UTF-8 编码必然
+    成功；客户端用任意标准 JSON 解析器即可无损还原原字符串，
+    “原样回显”语义不变。
+    """
+
+    def render(self, content: Any) -> bytes:
+        return json.dumps(
+            content,
+            ensure_ascii=True,
+            allow_nan=False,
+            indent=None,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+
 app = FastAPI(
     title="Container Gate Check-Digit Verification API",
     version="1.0.0",
@@ -46,7 +75,21 @@ app = FastAPI(
         "纯后端批量箱号校验位复算服务。每次接收 1-100 个恰为 11 位的 "
         "箱号；不做大小写或空白归一化。"
     ),
+    default_response_class=SafeJSONResponse,
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    # 与 FastAPI 默认形态一致（{"detail": [...]}），但错误详情会原样
+    # 回显非法输入，其中可能含未配对代理字符，必须走安全渲染，
+    # 否则请求形状错误本身也会以 500 中断。
+    return SafeJSONResponse(
+        status_code=422,
+        content={"detail": jsonable_encoder(exc.errors())},
+    )
 
 
 @app.get("/health")
@@ -84,7 +127,7 @@ def verify_container_numbers(request: VerifyRequest) -> VerifyResponse | JSONRes
                 position=error.position,
                 message=error.message,
             ).model_dump()
-            return JSONResponse(status_code=422, content=payload)
+            return SafeJSONResponse(status_code=422, content=payload)
 
     # 第二遍：结构全部合法，逐项复算，结论互不影响。
     results: list[ContainerResult] = []
@@ -178,7 +221,7 @@ def explain_container_number(request: ExplainRequest) -> ExplainResponse | JSONR
             position=error.position,
             message=error.message,
         ).model_dump()
-        return JSONResponse(status_code=422, content=payload)
+        return SafeJSONResponse(status_code=422, content=payload)
 
     # 结构合法：领域层生成不可变步骤明细，汇总值由步骤求和派生；
     # 路由与响应模型只做字段映射，不另行计算。

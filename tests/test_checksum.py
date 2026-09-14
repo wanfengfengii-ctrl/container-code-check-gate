@@ -374,3 +374,36 @@ def test_explain_requires_exact_length() -> None:
     for bad in ("CSQU305438", "CSQU30543834", "", " CSQU3054383"):
         with pytest.raises(ValueError):
             explain_check_digit(bad)
+
+
+# ------------------------------------------------------- 未配对代理字符
+
+
+def test_structure_error_unpaired_surrogate_is_first_position_error() -> None:
+    # 请求体 JSON 的 \uXXXX 转义可构造未配对代理字符；它不属于 A-Z，
+    # 结构判定必须在位置 1 报 not_uppercase_letter（不做任何归一化）。
+    for surrogate in ("\ud800", "\ud83d", "\udfff"):
+        number = surrogate + "SQU3054383"
+        assert len(number) == CONTAINER_LENGTH
+        error = structure_error(number)
+        assert error is not None
+        assert error.code == "not_uppercase_letter"
+        assert error.position == 1
+
+
+def test_correction_candidates_with_unpaired_surrogate_first_position() -> None:
+    # 首位为未配对代理字符的 11 位箱号：候选枚举照常完整生成，
+    # 差异位置 1 的候选原样携带该代理字符作为原字符。
+    number = "\ud800SQU3054383"
+    candidates = correction_candidates(number)
+    assert candidates
+    assert all(c.container_number != number for c in candidates)
+    position_one = [c for c in candidates if c.position == 1]
+    assert position_one
+    assert all(c.original_character == "\ud800" for c in position_one)
+    # 每个候选结构合法且校验位通过（与枚举口径一致）。
+    for candidate in candidates:
+        assert structure_error(candidate.container_number) is None
+        assert expected_check_digit(candidate.container_number[:10]) == int(
+            candidate.container_number[10]
+        )

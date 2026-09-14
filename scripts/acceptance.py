@@ -573,6 +573,55 @@ def run() -> int:
         reference_corrections("CSQU3054384"),
     )
 
+    # 24. 未配对代理字符：JSON \uXXXX 转义可构造，首位代理字符不属于 A-Z。
+    # 批量校验与明细入口必须在位置 1 报结构错误，纠错入口照常返回候选；
+    # 响应中的原样回显经 \uXXXX 转义传输，解析后无损还原。
+    surrogate_number = "\ud800SQU3054383"  # 恰 11 位，首位为未配对高代理字符
+    status, body = call_api(["CSQU3054383", surrogate_number])
+    checks.expect("24a 代理字符批次返回 422", status, 422)
+    checks.expect("24b status=invalid_batch", body["status"], "invalid_batch")
+    checks.expect("24c 最小非法索引=1", body["index"], 1)
+    checks.expect("24d 错误码", body["error_code"], "not_uppercase_letter")
+    checks.expect("24e 首个损坏位置=1", body["position"], 1)
+    checks.expect("24f 代理字符原样回显", body["container_number"], surrogate_number)
+    checks.check("24g 不返回任何逐项结果", "results" not in body, str(body))
+
+    status, body = call_explain(surrogate_number)
+    checks.expect("24h 代理字符明细返回 422", status, 422)
+    checks.expect("24i status=invalid_container", body["status"], "invalid_container")
+    checks.expect("24j 错误码", body["error_code"], "not_uppercase_letter")
+    checks.expect("24k 首个损坏位置=1", body["position"], 1)
+    checks.expect("24l 代理字符原样回显", body["container_number"], surrogate_number)
+    checks.check("24m 不返回明细", "steps" not in body, str(body))
+
+    status, body = call_correct(surrogate_number)
+    checks.expect("24n 代理字符纠错返回 200", status, 200)
+    checks.expect("24o 纠错状态 multiple", body["status"], "multiple")
+    checks.expect("24p 代理字符原样回显", body["container_number"], surrogate_number)
+    checks.expect(
+        "24q 候选与独立汉明距离枚举一致",
+        body["candidates"],
+        reference_corrections(surrogate_number),
+    )
+    checks.expect(
+        "24r candidate_count 与列表长度一致",
+        body["candidate_count"],
+        len(body["candidates"]),
+    )
+    checks.check(
+        "24s 位置1候选的原字符即代理字符",
+        any(
+            c["position"] == 1 and c["original_character"] == "\ud800"
+            for c in body["candidates"]
+        ),
+        str(body["candidates"]),
+    )
+
+    # 25. 请求形状错误的 detail 回显代理字符输入时仍正常返回 422
+    status, body = call_correct(surrogate_number + "X")  # 12 位，超长
+    checks.expect("25a 超长代理字符输入 422", status, 422)
+    checks.check("25b 请求形状错误 detail 形态", "detail" in body, str(body))
+
     return _report(checks)
 
 

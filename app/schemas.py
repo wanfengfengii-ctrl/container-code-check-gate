@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.checksum import CONTAINER_LENGTH
 
@@ -93,15 +93,28 @@ class CorrectRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    # 不用 min_length/max_length 约束：pydantic-core 对带约束的字符串
+    # 会先做 Unicode 标量转换，把含未配对代理字符（如首位为 \ud800 的
+    # 箱号）的合法长度输入误判为请求形状错误（string_unicode），使其
+    # 永远无法进入领域层生成纠错候选。恰为 11 位的检查改由下方的
+    # Python 校验器完成，错误形态仍是请求校验 422（detail 数组）。
     container_number: str = Field(
         ...,
-        min_length=CONTAINER_LENGTH,
-        max_length=CONTAINER_LENGTH,
         description=(
             f"待纠错箱号，必须恰为 {CONTAINER_LENGTH} 个字符。"
             "字符串原样使用，不进行大小写或空白归一化。"
         ),
     )
+
+    @field_validator("container_number")
+    @classmethod
+    def _exactly_eleven_characters(cls, value: str) -> str:
+        if len(value) != CONTAINER_LENGTH:
+            raise ValueError(
+                f"container number must be exactly {CONTAINER_LENGTH} "
+                f"characters, got {len(value)}"
+            )
+        return value
 
 
 class CorrectionCandidateOut(BaseModel):
