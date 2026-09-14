@@ -37,6 +37,58 @@ def _reference_weighted_sum(first_ten: str) -> int:
 
 
 VALID_ENDPOINT = "/api/v1/container-numbers/verify"
+CORRECT_ENDPOINT = "/api/v1/container-numbers/correct"
+
+
+def _hamming_distance(a: str, b: str) -> int:
+    """两等长串的差异位置数。"""
+    assert len(a) == len(b)
+    return sum(x != y for x, y in zip(a, b))
+
+
+def _reference_structure_ok(number: str) -> bool:
+    """测试侧独立结构判定：3 字母 + U/J/Z + 7 数字，恰 11 位。"""
+    if len(number) != 11:
+        return False
+    return (
+        all(c in string.ascii_uppercase for c in number[:3])
+        and number[3] in "UJZ"
+        and all(c in string.digits for c in number[4:])
+    )
+
+
+def _reference_corrections(number: str) -> list[dict[str, Any]]:
+    """测试侧独立参考实现：枚举与原值汉明距离恰为 1 的全部串，
+    用独立的结构判定与校验位复算筛选，按（差异位置, 替换字符）稳定排序。"""
+    candidates: list[dict[str, Any]] = []
+    for position in range(11):
+        if position < 3:
+            alphabet = string.ascii_uppercase
+        elif position == 3:
+            alphabet = "UJZ"
+        else:
+            alphabet = string.digits
+        for replacement in sorted(alphabet):
+            if replacement == number[position]:
+                continue
+            candidate = number[:position] + replacement + number[position + 1 :]
+            if not _reference_structure_ok(candidate):
+                continue
+            remainder = _reference_weighted_sum(candidate[:10]) % 11
+            expected = 0 if remainder == 10 else remainder
+            if expected == int(candidate[10]):
+                candidates.append(
+                    {
+                        "position": position + 1,
+                        "original_character": number[position],
+                        "replacement_character": replacement,
+                        "container_number": candidate,
+                    }
+                )
+    return sorted(
+        candidates,
+        key=lambda c: (c["position"], c["replacement_character"]),
+    )
 
 
 # ---------------------------------------------------------------- 基础路由
@@ -265,3 +317,126 @@ def test_echo_does_not_mutate_input() -> None:
         VALID_ENDPOINT, json={"container_numbers": ["AAAU0000060"]}
     )
     assert response.json()["results"][0]["container_number"] == "AAAU0000060"
+
+
+# -------------------------------------------------------------- 单箱纠错建议
+
+
+def test_correct_unique_candidate_matches_independent_hamming_scan() -> None:
+    # 类别码 X 非法：只有修成 U 后校验位吻合，其余单字符改动均不合法。
+    response = client.post(CORRECT_ENDPOINT, json={"container_number": "CSQX3054383"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "unique"
+    assert body["container_number"] == "CSQX3054383"
+    assert body["candidate_count"] == 1
+    assert body["candidates"] == _reference_corrections("CSQX3054383")
+    assert body["candidates"][0] == {
+        "position": 4,
+        "original_character": "X",
+        "replacement_character": "U",
+        "container_number": "CSQU3054383",
+    }
+
+
+def test_correct_multiple_candidates_stable_order_and_hamming_one() -> None:
+    # 末位抄错的经典样例：歧义情形，候选多于一个。
+    response = client.post(CORRECT_ENDPOINT, json={"container_number": "CSQU3054384"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "multiple"
+    assert body["candidate_count"] == len(body["candidates"]) > 1
+    assert body["candidates"] == _reference_corrections("CSQU3054384")
+    # 每个候选与原值汉明距离恰为 1，且不包含原号自身。
+    for candidate in body["candidates"]:
+        assert _hamming_distance(candidate["container_number"], "CSQU3054384") == 1
+        assert candidate["container_number"] != "CSQU3054384"
+    # 稳定排序：按（差异位置, 替换字符）升序。
+    keys = [(c["position"], c["replacement_character"]) for c in body["candidates"]]
+    assert keys == sorted(keys)
+
+
+def test_correct_no_candidate_still_returns_200() -> None:
+    # 合法请求但无任何单字符修复能同时满足结构与校验位。
+    response = client.post(CORRECT_ENDPOINT, json={"container_number": "CSQX3054380"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "not_found"
+    assert body["candidate_count"] == 0
+    assert body["candidates"] == []
+    assert _reference_corrections("CSQX3054380") == []
+
+
+def test_correct_valid_input_never_echoes_itself() -> None:
+    # 原号本身合法时，候选是其他合法号，原号（汉明距离 0）不得混入。
+    response = client.post(CORRECT_ENDPOINT, json={"container_number": "CSQU3054383"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["candidates"] == _reference_corrections("CSQU3054383")
+    assert body["candidate_count"] == len(body["candidates"])
+    for candidate in body["candidates"]:
+        assert _hamming_distance(candidate["container_number"], "CSQU3054383") == 1
+
+
+def test_correct_does_not_normalize_case_or_whitespace() -> None:
+    # 小写输入原样处理（不归一化为大写后再纠错），候选由独立参考实现界定。
+    response = client.post(CORRECT_ENDPOINT, json={"container_number": "csqu3054383"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["container_number"] == "csqu3054383"  # 原样回显
+    assert body["candidates"] == _reference_corrections("csqu3054383")
+
+    # 前导空白使长度为 12，按请求校验拒绝而非 trim。
+    spaced = client.post(CORRECT_ENDPOINT, json={"container_number": " CSQU3054383"})
+    assert spaced.status_code == 422
+    assert "detail" in spaced.json()
+
+
+def test_correct_request_shape_errors_are_422() -> None:
+    too_short = client.post(CORRECT_ENDPOINT, json={"container_number": "CSQU305438"})
+    assert too_short.status_code == 422
+    assert "detail" in too_short.json()
+
+    too_long = client.post(
+        CORRECT_ENDPOINT, json={"container_number": "CSQU30543834"}
+    )
+    assert too_long.status_code == 422
+
+    wrong_type = client.post(CORRECT_ENDPOINT, json={"container_number": 12345678901})
+    assert wrong_type.status_code == 422
+
+    missing = client.post(CORRECT_ENDPOINT, json={})
+    assert missing.status_code == 422
+
+    extra = client.post(
+        CORRECT_ENDPOINT,
+        json={"container_number": "CSQU3054383", "normalize": True},
+    )
+    assert extra.status_code == 422
+
+
+# ---------------------------------------------------- 先校验后纠错（回归旧接口）
+
+
+def test_verify_then_correct_flow_and_verify_regression() -> None:
+    # 调用方先批量校验筛出未通过项，再逐项提交纠错入口。
+    verify = client.post(
+        VALID_ENDPOINT,
+        json={"container_numbers": ["CSQU3054383", "CSQU3054384"]},
+    )
+    assert verify.status_code == 200
+    body = verify.json()
+    assert body["status"] == "ok"
+    assert [r["passed"] for r in body["results"]] == [True, False]
+
+    failed = [r["container_number"] for r in body["results"] if not r["passed"]]
+    assert failed == ["CSQU3054384"]
+
+    correction = client.post(CORRECT_ENDPOINT, json={"container_number": failed[0]})
+    assert correction.status_code == 200
+    assert correction.json()["status"] == "multiple"
+    # 真实箱号 CSQU3054383 必在候选之中。
+    assert any(
+        c["container_number"] == "CSQU3054383"
+        for c in correction.json()["candidates"]
+    )

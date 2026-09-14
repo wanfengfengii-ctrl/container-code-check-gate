@@ -16,6 +16,7 @@ from app.checksum import (
     CONTAINER_LENGTH,
     LETTER_VALUES,
     character_value,
+    correction_candidates,
     expected_check_digit,
     letter_value,
     split_container_number,
@@ -202,3 +203,73 @@ def test_split_container_number_fields() -> None:
     assert parts.category_identifier == "U"
     assert parts.serial_number == "305438"
     assert parts.check_digit == "3"
+
+
+# ---------------------------------------------------------------- 纠错候选
+
+
+def _hamming_distance(a: str, b: str) -> int:
+    assert len(a) == len(b)
+    return sum(x != y for x, y in zip(a, b))
+
+
+def test_correction_candidates_unique_for_invalid_category() -> None:
+    candidates = correction_candidates("CSQX3054383")
+    assert len(candidates) == 1
+    only = candidates[0]
+    assert only.position == 4
+    assert only.original_character == "X"
+    assert only.replacement_character == "U"
+    assert only.container_number == "CSQU3054383"
+
+
+def test_correction_candidates_empty_when_no_single_fix_works() -> None:
+    assert correction_candidates("CSQX3054380") == []
+
+
+def test_correction_candidates_are_valid_and_exactly_one_away() -> None:
+    original = "CSQU3054384"
+    candidates = correction_candidates(original)
+    assert len(candidates) > 1  # 歧义情形
+    for candidate in candidates:
+        # 候选自身结构合法、校验位通过（复用本模块判定复核）。
+        assert structure_error(candidate.container_number) is None
+        assert expected_check_digit(candidate.container_number[:10]) == int(
+            candidate.container_number[10]
+        )
+        # 与原值汉明距离恰为 1，且差异位置/字符与记录一致。
+        assert _hamming_distance(candidate.container_number, original) == 1
+        assert candidate.container_number[: candidate.position - 1] == original[
+            : candidate.position - 1
+        ]
+        assert candidate.container_number[candidate.position :] == original[
+            candidate.position :
+        ]
+        assert candidate.container_number[candidate.position - 1] == (
+            candidate.replacement_character
+        )
+        assert original[candidate.position - 1] == candidate.original_character
+        assert candidate.replacement_character != candidate.original_character
+
+
+def test_correction_candidates_sorted_by_position_then_replacement() -> None:
+    candidates = correction_candidates("CSQU3054384")
+    keys = [(c.position, c.replacement_character) for c in candidates]
+    assert keys == sorted(keys)
+
+
+def test_correction_candidates_never_include_original() -> None:
+    # 合法输入的候选是其他合法号；原号自身（汉明距离 0）不得混入。
+    candidates = correction_candidates("CSQU3054383")
+    assert candidates
+    assert all(c.container_number != "CSQU3054383" for c in candidates)
+    assert all(
+        _hamming_distance(c.container_number, "CSQU3054383") == 1
+        for c in candidates
+    )
+
+
+def test_correction_candidates_require_exact_length() -> None:
+    for bad in ("CSQU305438", "CSQU30543834", "", " CSQU3054383"):
+        with pytest.raises(ValueError):
+            correction_candidates(bad)

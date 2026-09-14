@@ -21,6 +21,7 @@ import urllib.request
 
 BASE_URL = os.environ.get("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 ENDPOINT = "/api/v1/container-numbers/verify"
+CORRECT_ENDPOINT = "/api/v1/container-numbers/correct"
 
 
 # --------------------------------------------------------------- 参考实现
@@ -55,6 +56,54 @@ def make_valid(prefix: str) -> str:
     return f"{prefix}{check}"
 
 
+def reference_structure_ok(number: str) -> bool:
+    """独立结构判定：3 大写字母 + U/J/Z + 7 数字，恰 11 位。"""
+    if len(number) != 11:
+        return False
+    return (
+        all(c in string.ascii_uppercase for c in number[:3])
+        and number[3] in "UJZ"
+        and all(c in string.digits for c in number[4:])
+    )
+
+
+def reference_corrections(number: str) -> list[dict]:
+    """枚举与原值汉明距离恰为 1 且结构、校验位均合法的候选，
+    按（差异位置, 替换字符）稳定排序；与服务端实现相互独立。"""
+    candidates: list[dict] = []
+    for position in range(11):
+        if position < 3:
+            alphabet = string.ascii_uppercase
+        elif position == 3:
+            alphabet = "UJZ"
+        else:
+            alphabet = string.digits
+        for replacement in sorted(alphabet):
+            if replacement == number[position]:
+                continue
+            candidate = number[:position] + replacement + number[position + 1 :]
+            if not reference_structure_ok(candidate):
+                continue
+            _, check = reference_check_digit(candidate[:10])
+            if check == int(candidate[10]):
+                candidates.append(
+                    {
+                        "position": position + 1,
+                        "original_character": number[position],
+                        "replacement_character": replacement,
+                        "container_number": candidate,
+                    }
+                )
+    return sorted(
+        candidates, key=lambda c: (c["position"], c["replacement_character"])
+    )
+
+
+def hamming_distance(a: str, b: str) -> int:
+    assert len(a) == len(b)
+    return sum(x != y for x, y in zip(a, b))
+
+
 # ----------------------------------------------------------------- HTTP
 
 
@@ -62,6 +111,21 @@ def call_api(numbers: list[str]) -> tuple[int, object]:
     data = json.dumps({"container_numbers": numbers}).encode("utf-8")
     request = urllib.request.Request(
         BASE_URL + ENDPOINT,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+def call_correct(number: object) -> tuple[int, object]:
+    data = json.dumps({"container_number": number}).encode("utf-8")
+    request = urllib.request.Request(
+        BASE_URL + CORRECT_ENDPOINT,
         data=data,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -223,6 +287,123 @@ def run() -> int:
     status, body = call_api([])
     checks.expect("11a 空批 422", status, 422)
     checks.check("11b 空批走 detail 形态", "detail" in body, str(body))
+
+    # 12. 先校验后纠错：批量接口筛出未通过项，再提交纠错入口
+    status, body = call_api(["CSQU3054383", "CSQU3054384"])
+    checks.expect("12a 批量校验 200", status, 200)
+    failed = [r["container_number"] for r in body["results"] if not r["passed"]]
+    checks.expect("12b 未通过项即手抄偏差号", failed, ["CSQU3054384"])
+    status, body = call_correct(failed[0])
+    checks.expect("12c 纠错请求 200", status, 200)
+    checks.expect("12d 歧义候选状态 multiple", body["status"], "multiple")
+    expected = reference_corrections("CSQU3054384")
+    checks.expect("12e 候选与独立汉明距离枚举一致", body["candidates"], expected)
+    checks.expect("12f 候选数大于 1", body["candidate_count"] > 1, True)
+    checks.expect(
+        "12g candidate_count 与列表长度一致",
+        body["candidate_count"],
+        len(body["candidates"]),
+    )
+    checks.check(
+        "12h 每个候选与原值汉明距离恰为 1",
+        all(
+            hamming_distance(c["container_number"], "CSQU3054384") == 1
+            for c in body["candidates"]
+        ),
+        str(body["candidates"]),
+    )
+    checks.check(
+        "12i 真实箱号在候选中",
+        any(c["container_number"] == "CSQU3054383" for c in body["candidates"]),
+        str(body["candidates"]),
+    )
+    checks.check(
+        "12j 候选按(位置,替换字符)稳定排序",
+        [(c["position"], c["replacement_character"]) for c in body["candidates"]]
+        == sorted((c["position"], c["replacement_character"]) for c in body["candidates"]),
+        str(body["candidates"]),
+    )
+
+    # 13. 唯一候选：类别码 X 非法，仅修成 U 后结构与校验位同时合法
+    status, body = call_correct("CSQX3054383")
+    checks.expect("13a 唯一候选请求 200", status, 200)
+    checks.expect("13b 状态 unique", body["status"], "unique")
+    checks.expect("13c 候选数 1", body["candidate_count"], 1)
+    checks.expect(
+        "13d 唯一候选内容",
+        body["candidates"],
+        [
+            {
+                "position": 4,
+                "original_character": "X",
+                "replacement_character": "U",
+                "container_number": "CSQU3054383",
+            }
+        ],
+    )
+    checks.expect(
+        "13e 与独立汉明距离枚举一致",
+        body["candidates"],
+        reference_corrections("CSQX3054383"),
+    )
+
+    # 14. 无候选：合法请求也返回 200 与 not_found
+    status, body = call_correct("CSQX3054380")
+    checks.expect("14a 无候选请求 200", status, 200)
+    checks.expect("14b 状态 not_found", body["status"], "not_found")
+    checks.expect("14c 候选数 0", body["candidate_count"], 0)
+    checks.expect("14d 候选列表为空", body["candidates"], [])
+    checks.expect(
+        "14e 独立汉明距离枚举同样为空",
+        reference_corrections("CSQX3054380"),
+        [],
+    )
+
+    # 15. 纠错入口不做归一化、不混入原号自身
+    status, body = call_correct("CSQU3054383")  # 原号本身合法
+    checks.expect("15a 合法原号请求 200", status, 200)
+    checks.check(
+        "15b 原号自身不出现在候选中",
+        all(
+            c["container_number"] != "CSQU3054383" for c in body["candidates"]
+        ),
+        str(body["candidates"]),
+    )
+    checks.expect(
+        "15c 与独立汉明距离枚举一致",
+        body["candidates"],
+        reference_corrections("CSQU3054383"),
+    )
+    status, body = call_correct("csqu3054383")  # 小写原样处理，不转大写
+    checks.expect("15d 小写输入 200", status, 200)
+    checks.expect("15e 小写原样回显", body["container_number"], "csqu3054383")
+    checks.expect(
+        "15f 小写候选与独立枚举一致",
+        body["candidates"],
+        reference_corrections("csqu3054383"),
+    )
+
+    # 16. 纠错入口请求形状校验：长度不符、类型错误均 422
+    for label, payload in [
+        ("16a 10 位", "CSQU305438"),
+        ("16b 12 位", "CSQU30543834"),
+        ("16c 前导空白(不 trim)", " CSQU3054383"),
+    ]:
+        status, body = call_correct(payload)
+        checks.expect(f"{label} 422", status, 422)
+        checks.check(f"{label} detail 形态", "detail" in body, str(body))
+    status, body = call_correct(12345678901)
+    checks.expect("16d 非字符串类型 422", status, 422)
+    checks.check("16e 类型错误 detail 形态", "detail" in body, str(body))
+
+    # 17. 旧接口回归：纠错引入后批量校验行为不变
+    status, body = call_api(["CSQU3054383", "csqu3054383"])
+    checks.expect("17a 旧接口非法批仍 422", status, 422)
+    checks.expect("17b 旧接口最小非法索引", body["index"], 1)
+    checks.expect("17c 旧接口错误码", body["error_code"], "not_uppercase_letter")
+    status, body = call_api(["CSQU3054383"])
+    checks.expect("17d 旧接口合法批仍 200", status, 200)
+    checks.expect("17e 旧接口通过标志", body["results"][0]["passed"], True)
 
     return _report(checks)
 

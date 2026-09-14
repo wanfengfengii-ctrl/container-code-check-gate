@@ -2,7 +2,8 @@
 
 纯后端服务：批量复算集装箱箱号的 ISO 6346 风格校验位，让闸口在放行前
 得到**可复算**的结论。手抄箱号错一位时，末位校验码对不上，服务会逐箱
-标出期望校验位、实际校验位与加权和。
+标出期望校验位、实际校验位与加权和；对未通过的箱号，还可提交单箱纠错
+入口，枚举“只差一个字符”的合法候选号。
 
 - 运行时：Python 3.12、FastAPI、Pydantic v2、Uvicorn
 - 无数据库、无外部依赖；字符映射与加权计算逻辑见 `app/checksum.py`
@@ -156,10 +157,71 @@ curl -s -X POST .../verify -H 'Content-Type: application/json' -d '{"container_n
 # {"detail":[{"type":"too_short", ... "min_length":1 ...}]}
 ```
 
+## 单箱纠错建议（先校验，后纠错）
+
+闸口的典型用法是**先用批量接口筛出未通过项，再把其中一个箱号提交到
+纠错入口**，判断它是否只是一次单字符抄录偏差：
+
+```bash
+# 第一步：批量校验，筛出 passed=false 的箱号
+curl -s -X POST http://localhost:8000/api/v1/container-numbers/verify \
+  -H 'Content-Type: application/json' \
+  -d '{"container_numbers": ["CSQU3054383", "CSQU3054384"]}'
+# -> results[1].passed == false，取出 "CSQU3054384"
+
+# 第二步：对未通过项请求单字符纠错建议
+curl -s -X POST http://localhost:8000/api/v1/container-numbers/correct \
+  -H 'Content-Type: application/json' \
+  -d '{"container_number": "CSQU3054384"}'
+```
+
+端点：`POST /api/v1/container-numbers/correct`
+请求体：`{"container_number": "..."}`，**恰为 11 个字符**，原样使用，
+不做大小写或空白归一化（长度不符、字段类型错误、多余字段均按请求校验
+返回 422 `detail`）。
+
+服务枚举与原值**仅一位不同**（汉明距离恰为 1）且**结构合法、校验位
+通过**的全部候选，按（差异位置, 替换字符）稳定排序返回；原号自身与
+相差多位的号码一律不进入结果。合法请求即使没有候选也返回 200：
+
+```json
+{
+  "status": "multiple",
+  "container_number": "CSQU3054384",
+  "candidate_count": 12,
+  "candidates": [
+    {
+      "position": 1,
+      "original_character": "C",
+      "replacement_character": "D",
+      "container_number": "DSQU3054384"
+    },
+    {
+      "position": 11,
+      "original_character": "4",
+      "replacement_character": "3",
+      "container_number": "CSQU3054383"
+    }
+  ]
+}
+```
+
+（上例省略了中间 10 个候选；`position` 从 1 起计。）
+
+`status` 取值：
+
+- `unique`：唯一候选，可直接与原始单证核对；
+- `multiple`：多个候选（如上例），需人工结合箱主代码等线索取舍；
+- `not_found`：未找到任何单字符修复，偏差不止一处或不属于抄录错误。
+
+每个候选给出差异位置、原字符、新字符与完整候选号，候选生成复用与批量
+校验相同的字符映射、结构判定与校验位计算。
+
 ## 测试
 
 字符映射跳号、加权位置敏感性、全部 11 种余数边界（含余 10→0、余 0→0）、
-结构首损定位、批量边界与两类 422 的区分均有覆盖：
+结构首损定位、批量边界与两类 422 的区分均有覆盖；纠错入口以独立汉明
+距离枚举断言唯一候选、歧义候选、无候选及旧接口回归：
 
 ```bash
 .venv/bin/pip install -r requirements-dev.txt
@@ -190,12 +252,12 @@ docker compose --profile acceptance up --build \
 
 ```
 app/
-  checksum.py     # 字符映射、加权和、期望校验位、结构判定（独立可测）
+  checksum.py     # 字符映射、加权和、期望校验位、结构判定、纠错候选（独立可测）
   schemas.py      # Pydantic 请求/响应模型
-  main.py         # FastAPI 路由：整批结构校验 + 逐项复算
+  main.py         # FastAPI 路由：整批结构校验 + 逐项复算 + 单箱纠错
 tests/
   test_checksum.py  # 映射跳号与余数边界等单元测试
-  test_api.py       # API 端到端测试
+  test_api.py       # API 端到端测试（含纠错入口独立汉明距离断言）
 scripts/
   acceptance.py     # verify 一次性验收脚本（仅用标准库）
 docker-compose.yml  # 仅 api 常驻；verify 为一次性任务

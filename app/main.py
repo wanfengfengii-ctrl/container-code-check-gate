@@ -11,10 +11,13 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from app.checksum import (
+    correction_candidates,
     expected_check_digit,
     split_container_number,
     structure_error,
@@ -23,6 +26,9 @@ from app.checksum import (
 from app.schemas import (
     ContainerPartsOut,
     ContainerResult,
+    CorrectRequest,
+    CorrectResponse,
+    CorrectionCandidateOut,
     InvalidBatchResponse,
     VerifyRequest,
     VerifyResponse,
@@ -108,4 +114,35 @@ def verify_container_numbers(request: VerifyRequest) -> VerifyResponse | JSONRes
         passed_count=passed_count,
         failed_count=len(container_numbers) - passed_count,
         results=results,
+    )
+
+
+@app.post(
+    "/api/v1/container-numbers/correct",
+    response_model=CorrectResponse,
+    summary="单箱纠错建议（汉明距离 1 的合法候选）",
+)
+def correct_container_number(request: CorrectRequest) -> CorrectResponse:
+    # 请求形状（恰为 11 位、字段类型）由 Pydantic 把关，不符即 422；
+    # 合法请求即使没有候选也返回 200 与 not_found 状态。
+    candidates = correction_candidates(request.container_number)
+    if len(candidates) == 1:
+        status: Literal["unique", "multiple", "not_found"] = "unique"
+    elif candidates:
+        status = "multiple"
+    else:
+        status = "not_found"
+    return CorrectResponse(
+        status=status,
+        container_number=request.container_number,
+        candidate_count=len(candidates),
+        candidates=[
+            CorrectionCandidateOut(
+                position=c.position,
+                original_character=c.original_character,
+                replacement_character=c.replacement_character,
+                container_number=c.container_number,
+            )
+            for c in candidates
+        ],
     )

@@ -146,3 +146,67 @@ def split_container_number(container_number: str) -> ContainerParts:
         serial_number=container_number[4:10],
         check_digit=container_number[10],
     )
+
+
+@dataclass(frozen=True)
+class CorrectionCandidate:
+    """单字符纠错候选：差异位置、原字符、新字符与完整候选号。
+
+    ``position`` 从 1 起计，与 :class:`StructureError` 的位置口径一致。
+    """
+
+    position: int
+    original_character: str
+    replacement_character: str
+    container_number: str
+
+
+def _allowed_characters(position: int) -> str:
+    """返回 0 起计位置上允许出现的字符全集（升序，保证枚举顺序稳定）。"""
+    if position < 3:
+        return "".join(sorted(LETTER_VALUES))
+    if position == 3:
+        return "".join(sorted(CATEGORY_IDENTIFIERS))
+    return "0123456789"
+
+
+def correction_candidates(container_number: str) -> list[CorrectionCandidate]:
+    """枚举与原值仅一位不同且结构、校验位均合法的候选箱号。
+
+    输入必须恰为 11 位（路由层按请求校验保证）；不做任何大小写或空白
+    归一化。逐位、逐字符枚举汉明距离恰为 1 的串，复用本模块的字符映射、
+    :func:`structure_error` 结构判定与 :func:`expected_check_digit` 校验位
+    计算筛选；原号自身（差异 0 位）与差异多位的号码一律不进入结果。
+    返回按（差异位置, 替换字符）稳定排序的候选列表。
+    """
+    if len(container_number) != CONTAINER_LENGTH:
+        raise ValueError(
+            f"container number must be exactly {CONTAINER_LENGTH} "
+            f"characters, got {len(container_number)}"
+        )
+
+    candidates: list[CorrectionCandidate] = []
+    for position in range(CONTAINER_LENGTH):
+        original = container_number[position]
+        for replacement in _allowed_characters(position):
+            if replacement == original:
+                continue  # 跳过原字符，保证汉明距离恰为 1
+            candidate = (
+                container_number[:position]
+                + replacement
+                + container_number[position + 1 :]
+            )
+            if structure_error(candidate) is not None:
+                continue
+            if expected_check_digit(candidate[:10]) != int(candidate[10]):
+                continue
+            candidates.append(
+                CorrectionCandidate(
+                    position=position + 1,
+                    original_character=original,
+                    replacement_character=replacement,
+                    container_number=candidate,
+                )
+            )
+    candidates.sort(key=lambda c: (c.position, c.replacement_character))
+    return candidates

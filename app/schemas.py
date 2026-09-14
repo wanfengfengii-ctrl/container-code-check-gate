@@ -86,3 +86,46 @@ class InvalidBatchResponse(BaseModel):
         ),
     )
     message: str
+
+
+class CorrectRequest(BaseModel):
+    """单箱纠错请求：一个恰为 11 位的箱号，原样使用，不做任何归一化。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    container_number: str = Field(
+        ...,
+        min_length=CONTAINER_LENGTH,
+        max_length=CONTAINER_LENGTH,
+        description=(
+            f"待纠错箱号，必须恰为 {CONTAINER_LENGTH} 个字符。"
+            "字符串原样使用，不进行大小写或空白归一化。"
+        ),
+    )
+
+
+class CorrectionCandidateOut(BaseModel):
+    """一个单字符纠错候选。"""
+
+    position: int = Field(..., description="差异字符位置（从 1 起）")
+    original_character: str = Field(..., description="原号在该位置的字符")
+    replacement_character: str = Field(..., description="候选号在该位置的字符")
+    container_number: str = Field(
+        ..., description="完整候选箱号（结构合法且校验位通过）"
+    )
+
+
+class CorrectResponse(BaseModel):
+    """单箱纠错结论：唯一候选、多个候选或未找到。"""
+
+    status: Literal["unique", "multiple", "not_found"] = Field(
+        ...,
+        description=(
+            "unique=唯一候选；multiple=多个候选；not_found=未找到候选"
+        ),
+    )
+    container_number: str = Field(..., description="原样回显的输入箱号")
+    candidate_count: int = Field(..., description="候选数量")
+    candidates: list[CorrectionCandidateOut] = Field(
+        ..., description="按（差异位置, 替换字符）稳定排序的候选列表"
+    )
