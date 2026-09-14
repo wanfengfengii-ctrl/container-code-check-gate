@@ -16,13 +16,18 @@ import pytest
 from app.checksum import (
     CONTAINER_LENGTH,
     LETTER_VALUES,
+    EXPECTED_LIST,
+    ONSITE_LIST,
     OwnerSummary,
+    ReconcileInvalidItem,
+    ReconcileResult,
     character_value,
     checksum_steps,
     correction_candidates,
     expected_check_digit,
     explain_check_digit,
     letter_value,
+    reconcile_container_numbers,
     split_container_number,
     structure_error,
     summarize_by_owner,
@@ -469,3 +474,316 @@ def test_correction_candidates_with_unpaired_surrogate_first_position() -> None:
         assert expected_check_digit(candidate.container_number[:10]) == int(
             candidate.container_number[10]
         )
+
+
+# ---------------------------------------------------------------- 清单核对
+
+# 经独立参考实现（本文件上方 _reference_letter_values）确认合法的箱号：
+# CSQU3054383（余 3）、AAAU0000060（余 10 折 0）、BBBU0000000（余 10 折 0）、
+# ABCU1234560（余 0）、MSCU6355895（余 5）。
+A = "CSQU3054383"
+B = "AAAU0000060"
+C = "BBBU0000000"
+D = "ABCU1234560"
+E = "MSCU6355895"
+
+# 结构合法但校验位不符的箱号（前 10 位与 A 相同，末位错为 4）。
+A_BAD = "CSQU3054384"
+
+
+def _reference_pairing(expected: list[str], onsite: list[str]) -> dict:
+    """测试侧独立参考配对实现：对每个完整箱号按出现次序对齐。
+
+    与服务端“现场侧建 FIFO 队列、预期侧逐项消费”的实现刻意不同：
+    收集两侧每个箱号的索引列表，zip 对齐得到配对，各自剩余的即差异。
+    """
+    expected_positions: dict[str, list[int]] = {}
+    onsite_positions: dict[str, list[int]] = {}
+    for i, n in enumerate(expected):
+        expected_positions.setdefault(n, []).append(i)
+    for i, n in enumerate(onsite):
+        onsite_positions.setdefault(n, []).append(i)
+
+    matched: list[tuple[str, int, int]] = []
+    missing: list[tuple[str, int]] = []
+    extra: list[tuple[str, int]] = []
+    for number, epos in expected_positions.items():
+        opos = onsite_positions.get(number, [])
+        k = min(len(epos), len(opos))
+        matched.extend((number, e, o) for e, o in zip(epos[:k], opos[:k]))
+        missing.extend((number, i) for i in epos[k:])
+    for number, opos in onsite_positions.items():
+        epos = expected_positions.get(number, [])
+        extra.extend((number, i) for i in opos[len(epos) :])
+
+    # 服务端口径：matched/missing 按预期顺序，extra 按现场顺序。
+    matched.sort(key=lambda t: t[1])
+    missing.sort(key=lambda t: t[1])
+    extra.sort(key=lambda t: t[1])
+    return {"matched": matched, "missing": missing, "extra": extra}
+
+
+def _assert_conservation(
+    expected: list[str], onsite: list[str], result: ReconcileResult
+) -> None:
+    """配对数量守恒与计数一致性。"""
+    assert result.expected_count == len(expected)
+    assert result.onsite_count == len(onsite)
+    assert result.matched_count == len(result.matched)
+    assert result.missing_count == len(result.missing)
+    assert result.extra_count == len(result.extra)
+    # 每条预期项要么配对要么缺少，每条现场项要么配对要么多出。
+    assert result.matched_count + result.missing_count == len(expected)
+    assert result.matched_count + result.extra_count == len(onsite)
+    # 每个箱号的配对数不超过任一侧的出现次数。
+    e_counts = {n: expected.count(n) for n in expected}
+    o_counts = {n: onsite.count(n) for n in onsite}
+    pair_counts: dict[str, int] = {}
+    for item in result.matched:
+        pair_counts[item.container_number] = (
+            pair_counts.get(item.container_number, 0) + 1
+        )
+    for number, count in pair_counts.items():
+        assert count <= e_counts[number]
+        assert count <= o_counts[number]
+
+
+def test_reconcile_identical_in_order_lists() -> None:
+    # 完全一致（顺序相同）：全部配对，无差异。
+    expected = [A, B, C]
+    result = reconcile_container_numbers(expected, [A, B, C])
+    assert isinstance(result, ReconcileResult)
+    assert (result.matched_count, result.missing_count, result.extra_count) == (
+        3,
+        0,
+        0,
+    )
+    assert [(m.container_number, m.expected_index, m.onsite_index) for m in result.matched] == [
+        (A, 0, 0),
+        (B, 1, 1),
+        (C, 2, 2),
+    ]
+    assert result.missing == ()
+    assert result.extra == ()
+    _assert_conservation(expected, [A, B, C], result)
+
+
+def test_reconcile_identical_shuffled_lists_pair_in_fifo_occurrence() -> None:
+    # 完全一致但乱序：仍全部配对；每个箱号按各自清单中的出现次序对齐。
+    expected = [A, B, A, C, B]
+    onsite = [B, A, C, A, B]
+    result = reconcile_container_numbers(expected, onsite)
+    assert isinstance(result, ReconcileResult)
+    assert result.matched_count == 5
+    assert result.missing_count == result.extra_count == 0
+    pairs = [(m.container_number, m.expected_index, m.onsite_index) for m in result.matched]
+    # matched 按预期清单顺序。
+    assert [p[1] for p in pairs] == [0, 1, 2, 3, 4]
+    # 同一箱号按出现次序 FIFO 对齐：A 的第 1/2 次配现场第 1/2 次，以此类推。
+    a_pairs = sorted((e, o) for n, e, o in pairs if n == A)
+    assert a_pairs == [(0, 1), (2, 3)]
+    b_pairs = sorted((e, o) for n, e, o in pairs if n == B)
+    assert b_pairs == [(1, 0), (4, 4)]
+    assert [(n, e, o) for n, e, o in pairs if n == C] == [(C, 3, 2)]
+    _assert_conservation(expected, onsite, result)
+    assert pairs == [tuple(x) for x in _reference_pairing(expected, onsite)["matched"]]
+
+
+def test_reconcile_single_sided_missing_and_extra() -> None:
+    # 单侧缺失 + 现场多出：missing 按预期顺序，extra 按现场顺序。
+    expected = [A, B, C]
+    onsite = [D, A, B]  # C 缺失；D 多出
+    result = reconcile_container_numbers(expected, onsite)
+    assert isinstance(result, ReconcileResult)
+    assert (result.matched_count, result.missing_count, result.extra_count) == (
+        2,
+        1,
+        1,
+    )
+    assert [(m.container_number, m.expected_index, m.onsite_index) for m in result.matched] == [
+        (A, 0, 1),
+        (B, 1, 2),
+    ]
+    assert [(m.container_number, m.expected_index) for m in result.missing] == [(C, 2)]
+    assert [(x.container_number, x.onsite_index) for x in result.extra] == [(D, 0)]
+    _assert_conservation(expected, onsite, result)
+
+
+def test_reconcile_missing_and_extra_preserve_list_order() -> None:
+    # 乱序且多项缺失/多出：结果严格保持各自清单顺序，并与独立参考一致。
+    expected = [C, A, D, B, E]
+    onsite = [E, B, D, A, D]  # 缺 C；D 现场 2 次/预期 1 次；E、A、B 配对
+    result = reconcile_container_numbers(expected, onsite)
+    assert isinstance(result, ReconcileResult)
+    reference = _reference_pairing(expected, onsite)
+    assert [(m.container_number, m.expected_index, m.onsite_index) for m in result.matched] == reference["matched"]
+    assert [(m.container_number, m.expected_index) for m in result.missing] == reference["missing"]
+    assert [(x.container_number, x.onsite_index) for x in result.extra] == reference["extra"]
+    # missing 按预期顺序：C(2) 在前；extra 按现场顺序：只有多出的 D(4)。
+    assert [(m.container_number, m.expected_index) for m in result.missing] == [
+        (C, 0)
+    ]
+    assert [(x.container_number, x.onsite_index) for x in result.extra] == [(D, 4)]
+    _assert_conservation(expected, onsite, result)
+
+
+def test_reconcile_duplicate_count_mismatch_only_last_occurrence_differs() -> None:
+    # 同一箱号一侧三次、另一侧两次：前两次配对，只有最后一次归入差异。
+    # 预期侧 3 次、现场侧 2 次 -> 最后一次（预期索引 3）为 missing。
+    expected = [A, B, A, A]
+    onsite = [A, A, B]
+    result = reconcile_container_numbers(expected, onsite)
+    assert isinstance(result, ReconcileResult)
+    assert result.matched_count == 3
+    assert [(m.container_number, m.expected_index, m.onsite_index) for m in result.matched] == [
+        (A, 0, 0),
+        (B, 1, 2),
+        (A, 2, 1),
+    ]
+    assert [(m.container_number, m.expected_index) for m in result.missing] == [(A, 3)]
+    assert result.extra == ()
+    _assert_conservation(expected, onsite, result)
+
+    # 现场侧 3 次、预期侧 2 次 -> 最后一次（现场索引 2）为 extra。
+    expected = [B, A]
+    onsite = [A, B, A]
+    result = reconcile_container_numbers(expected, onsite)
+    assert isinstance(result, ReconcileResult)
+    assert result.matched_count == 2
+    assert result.missing == ()
+    assert [(x.container_number, x.onsite_index) for x in result.extra] == [(A, 2)]
+    _assert_conservation(expected, onsite, result)
+
+
+def test_reconcile_repeated_numbers_conservation_across_shuffled_samples() -> None:
+    # 乱序 + 重复的组合样例：与独立参考逐字段一致，且配对数量守恒。
+    samples = [
+        ([A, A, B], [B, A, A]),
+        ([A, B, A, B, C], [C, B, A, B, A]),
+        ([A, A, A], [A, A]),
+        ([A, A], [A, A, A]),
+        ([A, B, C, A], [A, A, B, C]),
+        ([E, E, D, E, D], [D, E, D, E, E]),
+        ([A, B, C, D, E], [E, D, C, B, A]),
+    ]
+    for expected, onsite in samples:
+        result = reconcile_container_numbers(expected, onsite)
+        assert isinstance(result, ReconcileResult), (expected, onsite)
+        reference = _reference_pairing(expected, onsite)
+        pairs = [(m.container_number, m.expected_index, m.onsite_index) for m in result.matched]
+        miss = [(m.container_number, m.expected_index) for m in result.missing]
+        extra = [(x.container_number, x.onsite_index) for x in result.extra]
+        assert pairs == reference["matched"], (expected, onsite)
+        assert miss == reference["missing"], (expected, onsite)
+        assert extra == reference["extra"], (expected, onsite)
+        _assert_conservation(expected, onsite, result)
+
+
+def test_reconcile_no_normalization_distinct_strings_never_pair() -> None:
+    # 不做大小写或空白归一化：合法号与视觉相近的串即使结构/校验不同，
+    # 也不会被当作同一完整箱号配对（这里小写号结构非法，整次核对拒绝）。
+    result = reconcile_container_numbers([A], ["csqu3054383"])
+    assert isinstance(result, ReconcileInvalidItem)
+    assert result.list_source == ONSITE_LIST
+    assert result.index == 0
+
+
+def test_reconcile_structure_invalid_in_expected_list_rejected() -> None:
+    # 预期清单含结构非法项：拒绝，来源 expected、最小索引、首个损坏位置。
+    result = reconcile_container_numbers([A, "csqu3054383"], [A])
+    assert isinstance(result, ReconcileInvalidItem)
+    assert result.list_source == EXPECTED_LIST
+    assert result.index == 1
+    assert result.container_number == "csqu3054383"
+    assert result.structure_error is not None
+    assert result.structure_error.code == "not_uppercase_letter"
+    assert result.structure_error.position == 1
+    assert result.expected_check_digit is None
+    assert result.actual_check_digit is None
+    assert result.passed is False
+
+
+def test_reconcile_structure_invalid_in_onsite_list_rejected() -> None:
+    # 现场清单含结构非法项（预期清单已全部有效）：来源 onsite。
+    result = reconcile_container_numbers([A], [A, "CSQX3054383"])
+    assert isinstance(result, ReconcileInvalidItem)
+    assert result.list_source == ONSITE_LIST
+    assert result.index == 1
+    assert result.structure_error is not None
+    assert result.structure_error.code == "invalid_category_identifier"
+    assert result.structure_error.position == 4
+    assert result.expected_check_digit is None
+    assert result.actual_check_digit is None
+
+
+def test_reconcile_expected_list_checked_before_onsite_list() -> None:
+    # 两侧都有无效项时先报预期清单（即便现场侧索引更小）。
+    result = reconcile_container_numbers(
+        [A, "CSQX3054383"], ["!!", A]
+    )
+    assert isinstance(result, ReconcileInvalidItem)
+    assert result.list_source == EXPECTED_LIST
+    assert result.index == 1
+
+
+def test_reconcile_minimum_invalid_index_within_list() -> None:
+    # 清单内多个无效项：报最小索引；合法项在前不影响定位。
+    result = reconcile_container_numbers([A, "!!", "csqu3054383"], [A])
+    assert isinstance(result, ReconcileInvalidItem)
+    assert result.list_source == EXPECTED_LIST
+    assert result.index == 1
+    assert result.structure_error is not None
+    assert result.structure_error.code == "invalid_length"
+    assert result.structure_error.position == 3
+
+
+def test_reconcile_check_digit_mismatch_rejected_with_original_verdict() -> None:
+    # 结构合法但校验位不符：同样拒绝；结构字段为空，携带期望/实际校验位。
+    result = reconcile_container_numbers([A], [A_BAD])
+    assert isinstance(result, ReconcileInvalidItem)
+    assert result.list_source == ONSITE_LIST
+    assert result.index == 0
+    assert result.container_number == A_BAD
+    assert result.structure_error is None
+    assert result.expected_check_digit == 3
+    assert result.actual_check_digit == 4
+    assert result.passed is False
+
+
+def test_reconcile_check_digit_mismatch_in_expected_list() -> None:
+    # 预期清单中的校验位不符同样拒绝（当班作业清单也必须先过校验）。
+    result = reconcile_container_numbers([A_BAD], [A])
+    assert isinstance(result, ReconcileInvalidItem)
+    assert result.list_source == EXPECTED_LIST
+    assert result.structure_error is None
+    assert (result.expected_check_digit, result.actual_check_digit) == (3, 4)
+
+
+def test_reconcile_invalid_returns_no_pairing_payload() -> None:
+    # 拒绝时返回类型是 ReconcileInvalidItem，而不是携带任何配对结果。
+    result = reconcile_container_numbers([A, "CSQU305438A"], [A])
+    assert isinstance(result, ReconcileInvalidItem)
+    assert not isinstance(result, ReconcileResult)
+
+
+def test_reconcile_results_are_immutable() -> None:
+    result = reconcile_container_numbers([A], [A])
+    assert isinstance(result, ReconcileResult)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        result.matched_count = 0  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        result.matched[0].container_number = ""  # type: ignore[misc]
+
+
+def test_reconcile_empty_valid_lists_when_called_directly() -> None:
+    # 领域函数本身不限制清单长度（长度 1..100 由契约层保证）：
+    # 两份空清单是一次无差异的合法核对。
+    result = reconcile_container_numbers([], [])
+    assert isinstance(result, ReconcileResult)
+    assert (result.expected_count, result.onsite_count) == (0, 0)
+    assert (result.matched_count, result.missing_count, result.extra_count) == (
+        0,
+        0,
+        0,
+    )
+    assert result.matched == result.missing == result.extra == ()

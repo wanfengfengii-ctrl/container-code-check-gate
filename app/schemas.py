@@ -237,3 +237,143 @@ class InvalidContainerResponse(BaseModel):
         ),
     )
     message: str
+
+
+# ------------------------------------------------------------- 一次性清单核对
+
+
+class ReconcileRequest(BaseModel):
+    """一次性清单核对请求：当班作业清单（预期）与现场扫描清单。
+
+    两份清单均为 1..100 个箱号，原样传递，不做任何字符串归一化；清单
+    内部顺序即输入顺序，领域层按此顺序配对并保持结果顺序。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_container_numbers: list[str] = Field(
+        ...,
+        min_length=MIN_BATCH,
+        max_length=MAX_BATCH,
+        description=(
+            "当班作业清单（预期箱号列表，含端点 1 至 100 个）。字符串原样"
+            "使用，不进行大小写或空白归一化；顺序即原索引顺序。"
+        ),
+    )
+    onsite_container_numbers: list[str] = Field(
+        ...,
+        min_length=MIN_BATCH,
+        max_length=MAX_BATCH,
+        description=(
+            "现场扫描清单（实际扫到的箱号列表，含端点 1 至 100 个）。字符串"
+            "原样使用，不进行大小写或空白归一化；顺序即原索引顺序。"
+        ),
+    )
+
+
+class MatchedContainerOut(BaseModel):
+    """一对成功配对的箱号及其在两份清单中的原索引。"""
+
+    container_number: str = Field(..., description="完整箱号（两侧一致）")
+    expected_index: int = Field(
+        ..., description="在预期清单中的原索引（从 0 起）"
+    )
+    onsite_index: int = Field(
+        ..., description="在现场清单中的原索引（从 0 起）"
+    )
+
+
+class MissingContainerOut(BaseModel):
+    """预期清单中存在、现场缺少对应次数的箱号。"""
+
+    container_number: str = Field(..., description="完整箱号")
+    expected_index: int = Field(
+        ..., description="在预期清单中的原索引（从 0 起）"
+    )
+
+
+class ExtraContainerOut(BaseModel):
+    """现场清单中存在、预期清单没有对应次数的箱号。"""
+
+    container_number: str = Field(..., description="完整箱号")
+    onsite_index: int = Field(
+        ..., description="在现场清单中的原索引（从 0 起）"
+    )
+
+
+class ReconcileResponse(BaseModel):
+    """两份清单全部结构合法且校验通过时的配对结论。
+
+    配对按完整箱号以重复次数逐次进行；``matched`` 按预期清单顺序、
+    ``missing`` 按预期清单顺序、``extra`` 按现场清单顺序排列。恒有
+    ``matched_count + missing_count == expected_count`` 与
+    ``matched_count + extra_count == onsite_count``。
+    """
+
+    status: Literal["ok"] = "ok"
+    expected_count: int = Field(..., description="预期清单项数")
+    onsite_count: int = Field(..., description="现场清单项数")
+    matched_count: int = Field(..., description="两侧成功配对的箱数")
+    missing_count: int = Field(..., description="预期中缺少（现场未扫到）的项数")
+    extra_count: int = Field(..., description="现场多出（预期无此项）的项数")
+    matched: list[MatchedContainerOut] = Field(
+        ..., description="已匹配项，按预期清单中的先后顺序"
+    )
+    missing: list[MissingContainerOut] = Field(
+        ..., description="预期中缺少项，按预期清单中的先后顺序"
+    )
+    extra: list[ExtraContainerOut] = Field(
+        ..., description="现场多出项，按现场清单中的先后顺序"
+    )
+
+
+class ReconcileInvalidItemResponse(BaseModel):
+    """任一清单含无效箱号时整次核对拒绝：明确清单来源、最小输入索引与原校验结论。
+
+    无效原因有两种，字段互斥地承载各自的原校验结论：
+
+    * **结构非法**：``error_code`` / ``position`` / ``message`` 给出与批量
+      校验 :class:`InvalidBatchResponse` 同口径的首个损坏位置，两个校验位
+      字段为 ``null``（结构非法时不做校验位复算）；
+    * **校验位不符**：结构合法但末位校验码错误，三个结构字段为 ``null``，
+      ``expected_check_digit`` / ``actual_check_digit`` 给出与批量校验逐项
+      结论同口径的期望与实际校验位。
+
+    两种情形 ``passed`` 均为 ``false``。定位顺序为：先按索引扫描预期清单，
+    预期清单全部有效后再扫描现场清单，故索引为该来源清单中的最小无效索引。
+    """
+
+    status: Literal["invalid_item"] = "invalid_item"
+    expected_count: int = Field(..., description="本次提交的预期清单项数")
+    onsite_count: int = Field(..., description="本次提交的现场清单项数")
+    list_source: Literal["expected", "onsite"] = Field(
+        ...,
+        description="无效项来源：expected=当班作业清单，onsite=现场扫描清单",
+    )
+    index: int = Field(
+        ..., description="无效项在其来源清单中的最小输入索引（从 0 起）"
+    )
+    container_number: str = Field(..., description="该无效项的原样输入")
+    error_code: str | None = Field(
+        ...,
+        description="结构错误代码（与批量校验一致）；校验位不符时为 null",
+    )
+    position: int | None = Field(
+        ...,
+        description=(
+            f"箱号内首个损坏字符的位置（从 1 起，共 {CONTAINER_LENGTH} 位）；"
+            "校验位不符时为 null"
+        ),
+    )
+    message: str | None = Field(
+        ..., description="结构错误说明；校验位不符时为 null"
+    )
+    expected_check_digit: int | None = Field(
+        ..., description="结构合法但校验位不符时的期望校验位；结构非法时为 null"
+    )
+    actual_check_digit: int | None = Field(
+        ..., description="结构合法但校验位不符时的实际校验位；结构非法时为 null"
+    )
+    passed: Literal[False] = Field(
+        ..., description="原校验结论：无效项恒为 false"
+    )

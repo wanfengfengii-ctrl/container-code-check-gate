@@ -6,7 +6,10 @@
 按箱主首次出现顺序给出每组总数、通过数与未通过数，供班组分配人工复核
 量；对未通过的箱号，还可提交单箱纠错入口，枚举"只差一个字符"的合法
 候选号；对校验结论有争议时，可提交单箱计算明细入口，逐字符还原映射值、
-权重与乘积的完整计算过程供现场复核。
+权重与乘积的完整计算过程供现场复核。**换班交接**时还可使用一次性清单
+核对入口：当班作业清单（预期）与现场扫描清单各自先通过结构与校验位
+校验，再按完整箱号以重复次数逐次配对，直接给出已匹配项、预期中缺少项
+与现场多出项及其原索引，免去人工逐项比对。
 
 - 运行时：Python 3.12、FastAPI、Pydantic v2、Uvicorn
 - 无数据库、无外部依赖；字符映射与加权计算逻辑见 `app/checksum.py`
@@ -310,6 +313,143 @@ curl -s -X POST http://localhost:8000/api/v1/container-numbers/explain \
 }
 ```
 
+## 一次性清单核对（换班交接）
+
+闸口换班交接时，班组要确认**现场扫到的箱号**是否与**当班作业清单**
+一致。人工逐项比对容易漏掉重复箱（同一箱号扫了多次）或把重复次数数错，
+因此在批量校验等既有能力之外提供一次性清单核对入口，一次调用直接给出
+三类结果：
+
+端点：`POST /api/v1/container-numbers/reconcile`
+请求体：
+
+```json
+{
+  "expected_container_numbers": ["...当班作业清单..."],
+  "onsite_container_numbers": ["...现场扫描清单..."]
+}
+```
+
+两份清单各为 **1 至 100** 个箱号（沿用批量上限），字符串原样使用、不做
+任何归一化；数组顺序即原索引顺序。
+
+### 先校验，后配对
+
+服务**先按各自输入顺序**复用既有的结构判定（`structure_error`）与校验位
+计算（`expected_check_digit`）逐项检查：扫描顺序为先预期清单、后现场
+清单，清单内按索引从小到大。**任一**箱号结构非法或校验位不符即整次
+核对拒绝（见下），不产生任何配对结果；两份清单全部有效后，才按
+**完整箱号以重复次数逐次配对**：
+
+- 同一箱号的第 k 次出现，与另一侧的第 k 次出现配成一对；
+- 某侧出现次数多于另一侧时，**只有最后若干次**（按各自清单顺序）归入
+  差异——同一箱号出现三次而另一侧只有两次时，前两次配对，仅**最后一次**
+  成为缺少项或多出项；
+- 乱序不影响配对，配对依据是完整箱号与出现次序，而非数组下标。
+
+结果分三类，均携带在原清单中的索引（从 0 起）：
+
+- `matched`：已匹配项（箱号 + 两侧原索引），按**预期清单**顺序；
+- `missing`：预期中缺少项（现场未扫到对应次数），按**预期清单**顺序；
+- `extra`：现场多出项（预期无对应次数），按**现场清单**顺序。
+
+配对数量守恒：`matched_count + missing_count == expected_count`，
+`matched_count + extra_count == onsite_count`。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/container-numbers/reconcile \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_container_numbers": ["CSQU3054383", "AAAU0000060", "BBBU0000000"],
+       "onsite_container_numbers": ["ABCU1234560", "CSQU3054383", "AAAU0000060"]}'
+```
+
+上例现场缺少 `BBBU0000000`、多出 `ABCU1234560`：
+
+```json
+{
+  "status": "ok",
+  "expected_count": 3,
+  "onsite_count": 3,
+  "matched_count": 2,
+  "missing_count": 1,
+  "extra_count": 1,
+  "matched": [
+    {"container_number": "CSQU3054383", "expected_index": 0, "onsite_index": 1},
+    {"container_number": "AAAU0000060", "expected_index": 1, "onsite_index": 2}
+  ],
+  "missing": [
+    {"container_number": "BBBU0000000", "expected_index": 2}
+  ],
+  "extra": [
+    {"container_number": "ABCU1234560", "onsite_index": 0}
+  ]
+}
+```
+
+重复次数不等时，只有最后一次进入差异（预期 3 次 `CSQU3054383`、
+现场 2 次，仅预期索引 3 成为缺少项）：
+
+```json
+{
+  "status": "ok",
+  "expected_count": 4,
+  "onsite_count": 3,
+  "matched_count": 3,
+  "missing_count": 1,
+  "extra_count": 0,
+  "matched": [
+    {"container_number": "CSQU3054383", "expected_index": 0, "onsite_index": 0},
+    {"container_number": "AAAU0000060", "expected_index": 1, "onsite_index": 2},
+    {"container_number": "CSQU3054383", "expected_index": 2, "onsite_index": 1}
+  ],
+  "missing": [
+    {"container_number": "CSQU3054383", "expected_index": 3}
+  ],
+  "extra": []
+}
+```
+
+### 无效箱号拒绝（HTTP 422, `status=invalid_item`）
+
+任一清单含**结构非法或校验位不符**的箱号时整次核对拒绝，明确无效项的
+**清单来源**（`list_source` 为 `expected` / `onsite`）、在该清单中的
+**最小输入索引**（`index`，从 0 起）与**原校验结论**：
+
+- **结构非法**：`error_code` / `position` / `message` 给出与批量校验
+  `invalid_batch` 同口径的首个损坏位置与错误代码，
+  `expected_check_digit` / `actual_check_digit` 为 `null`（结构非法时
+  不做校验位复算）；
+- **校验位不符**：结构合法但末位校验码错误，三个结构字段为 `null`，
+  `expected_check_digit` / `actual_check_digit` 给出与批量校验逐项结论
+  同口径的期望与实际校验位。
+
+两种情形 `passed` 均为 `false`，且不返回 `matched` / `missing` /
+`extra`。定位顺序为先预期清单后现场清单（即便现场侧无效索引更小也先报
+预期侧），清单内取最小索引。
+
+```json
+{
+  "status": "invalid_item",
+  "expected_count": 1,
+  "onsite_count": 1,
+  "list_source": "onsite",
+  "index": 0,
+  "container_number": "CSQU3054384",
+  "error_code": null,
+  "position": null,
+  "message": null,
+  "expected_check_digit": 3,
+  "actual_check_digit": 4,
+  "passed": false
+}
+```
+
+### 请求形状错误（HTTP 422, Pydantic `detail`）
+
+任一清单为空、超过 100 项，或字段缺失 / 类型错误 / 多余字段，返回
+FastAPI 标准 `{"detail": [...]}`，与上面的业务负载
+`{"status": "invalid_item", ...}` 明确区分。
+
 ## 未配对代理字符
 
 请求体 JSON 的 `\uXXXX` 转义可构造**未配对代理字符**（如首位为
@@ -333,7 +473,11 @@ curl -s -X POST http://localhost:8000/api/v1/container-numbers/explain \
 参考实现断言已知样例的十项乘积、余数十折零边界、结构错误定位，并逐箱
 确认明细合计与结论始终等于批量校验结果；箱主汇总以交错输入断言首次
 出现顺序与计数（测试侧整批重扫独立归组），并以旧请求快照锁定开关省略
-或为假时的逐字段兼容：
+或为假时的逐字段兼容；清单核对以乱序及重复样例断言配对结果与独立
+"按出现次序对齐"参考逐字段一致、配对数量守恒（配对+缺少=预期总数、
+配对+多出=现场总数、原索引不重不漏），并覆盖完全一致、单侧缺失、
+重复次数不等（三次对两次时仅最后一次入差异）与非法箱号拒绝（来源、
+最小索引、结构/校验位两类原结论）四种场景：
 
 ```bash
 .venv/bin/pip install -r requirements-dev.txt
@@ -364,12 +508,12 @@ docker compose --profile acceptance up --build \
 
 ```
 app/
-  checksum.py     # 字符映射、加权和、期望校验位、结构判定、纠错候选、计算明细、箱主汇总（独立可测）
+  checksum.py     # 字符映射、加权和、期望校验位、结构判定、纠错候选、计算明细、箱主汇总、清单核对（独立可测）
   schemas.py      # Pydantic 请求/响应模型
-  main.py         # FastAPI 路由：整批结构校验 + 逐项复算 + 可选箱主汇总 + 单箱纠错 + 单箱明细
+  main.py         # FastAPI 路由：整批结构校验 + 逐项复算 + 可选箱主汇总 + 单箱纠错 + 单箱明细 + 一次性清单核对
 tests/
-  test_checksum.py  # 映射跳号与余数边界等单元测试
-  test_api.py       # API 端到端测试（含纠错、明细、箱主汇总的独立参考断言）
+  test_checksum.py  # 映射跳号、余数边界、清单配对等单元测试
+  test_api.py       # API 端到端测试（含纠错、明细、箱主汇总、清单核对的独立参考断言）
 scripts/
   acceptance.py     # verify 一次性验收脚本（仅用标准库）
 docker-compose.yml  # 仅 api 常驻；verify 为一次性任务

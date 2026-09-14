@@ -40,6 +40,7 @@ def _reference_weighted_sum(first_ten: str) -> int:
 VALID_ENDPOINT = "/api/v1/container-numbers/verify"
 CORRECT_ENDPOINT = "/api/v1/container-numbers/correct"
 EXPLAIN_ENDPOINT = "/api/v1/container-numbers/explain"
+RECONCILE_ENDPOINT = "/api/v1/container-numbers/reconcile"
 
 
 def _reference_steps(first_ten: str) -> list[dict[str, Any]]:
@@ -883,3 +884,359 @@ def test_request_shape_error_with_surrogate_input_still_returns_detail() -> None
     )
     assert response.status_code == 422
     assert "detail" in response.json()
+
+
+# ------------------------------------------------------------ 一次性清单核对
+
+# 经测试侧独立参考实现确认合法的箱号（校验位均通过）。
+R_A = "CSQU3054383"  # 加权和 6185，余 3，校验位 3
+R_B = "AAAU0000060"  # 加权和 3398，余 10 折 0
+R_C = "BBBU0000000"  # 加权和 340，余 10 折 0
+R_D = "ABCU1234560"  # 加权和 5478，余 0
+R_E = "MSCU6355895"  # 加权和 8200，余 5
+# 结构合法但校验位不符。
+R_A_BAD = "CSQU3054384"
+
+
+def _reconcile(expected: object, onsite: object) -> Any:
+    """以两份清单调用一次性核对入口（允许传入任意形状用于 422 断言）。"""
+    return client.post(
+        RECONCILE_ENDPOINT,
+        json={
+            "expected_container_numbers": expected,
+            "onsite_container_numbers": onsite,
+        },
+    )
+
+
+def _reference_reconcile(
+    expected: list[str], onsite: list[str]
+) -> dict[str, list[Any]]:
+    """测试侧独立配对参考：逐箱号收集两侧索引后按出现次序对齐。
+
+    与服务端的 FIFO 队列实现刻意不同；matched/missing 按预期索引排序，
+    extra 按现场索引排序，以对应契约规定的清单顺序。
+    """
+    epos: dict[str, list[int]] = {}
+    opos: dict[str, list[int]] = {}
+    for i, n in enumerate(expected):
+        epos.setdefault(n, []).append(i)
+    for i, n in enumerate(onsite):
+        opos.setdefault(n, []).append(i)
+
+    matched: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    extra: list[dict[str, Any]] = []
+    for number, ep in epos.items():
+        op = opos.get(number, [])
+        k = min(len(ep), len(op))
+        matched.extend(
+            {
+                "container_number": number,
+                "expected_index": e,
+                "onsite_index": o,
+            }
+            for e, o in zip(ep[:k], op[:k])
+        )
+        missing.extend(
+            {"container_number": number, "expected_index": i} for i in ep[k:]
+        )
+    for number, op in opos.items():
+        ep = epos.get(number, [])
+        extra.extend(
+            {"container_number": number, "onsite_index": i} for i in op[len(ep) :]
+        )
+    matched.sort(key=lambda m: m["expected_index"])
+    missing.sort(key=lambda m: m["expected_index"])
+    extra.sort(key=lambda m: m["onsite_index"])
+    return {"matched": matched, "missing": missing, "extra": extra}
+
+
+def _assert_reconcile_counts(body: dict[str, Any]) -> None:
+    """配对数量守恒：各项数与列表长度、两侧清单长度一致。"""
+    assert body["matched_count"] == len(body["matched"])
+    assert body["missing_count"] == len(body["missing"])
+    assert body["extra_count"] == len(body["extra"])
+    assert body["matched_count"] + body["missing_count"] == body["expected_count"]
+    assert body["matched_count"] + body["extra_count"] == body["onsite_count"]
+
+
+def test_reconcile_identical_lists_all_matched() -> None:
+    # 场景一：完全一致（乱序）仍全部配对，原索引各自正确。
+    expected = [R_A, R_B, R_C]
+    onsite = [R_C, R_A, R_B]
+    response = _reconcile(expected, onsite)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["expected_count"] == 3
+    assert body["onsite_count"] == 3
+    assert (body["matched_count"], body["missing_count"], body["extra_count"]) == (
+        3,
+        0,
+        0,
+    )
+    # matched 按预期清单顺序，onsite_index 指向乱序后的现场位置。
+    assert body["matched"] == [
+        {"container_number": R_A, "expected_index": 0, "onsite_index": 1},
+        {"container_number": R_B, "expected_index": 1, "onsite_index": 2},
+        {"container_number": R_C, "expected_index": 2, "onsite_index": 0},
+    ]
+    assert body["missing"] == []
+    assert body["extra"] == []
+    _assert_reconcile_counts(body)
+
+
+def test_reconcile_single_sided_missing_and_extra() -> None:
+    # 场景二：单侧缺失与现场多出并存（乱序）。
+    expected = [R_A, R_B, R_C]
+    onsite = [R_D, R_A, R_B]  # 缺 R_C，多 R_D
+    response = _reconcile(expected, onsite)
+    assert response.status_code == 200
+    body = response.json()
+    assert (body["matched_count"], body["missing_count"], body["extra_count"]) == (
+        2,
+        1,
+        1,
+    )
+    assert body["matched"] == [
+        {"container_number": R_A, "expected_index": 0, "onsite_index": 1},
+        {"container_number": R_B, "expected_index": 1, "onsite_index": 2},
+    ]
+    # 缺少项按预期清单顺序，携带预期原索引。
+    assert body["missing"] == [
+        {"container_number": R_C, "expected_index": 2}
+    ]
+    # 多出项按现场清单顺序，携带现场原索引。
+    assert body["extra"] == [{"container_number": R_D, "onsite_index": 0}]
+    _assert_reconcile_counts(body)
+
+
+def test_reconcile_duplicate_counts_unequal_only_last_occurrence_differs() -> None:
+    # 场景三：重复次数不等。同一箱号一侧三次、另一侧两次时，只有最后一次
+    # （按各自清单顺序）归入差异。
+    # 预期 3 次 R_A、现场 2 次：预期最后一次（索引 3）为 missing。
+    response = _reconcile(
+        [R_A, R_B, R_A, R_A],
+        [R_A, R_A, R_B],
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert (body["matched_count"], body["missing_count"], body["extra_count"]) == (
+        3,
+        1,
+        0,
+    )
+    assert body["missing"] == [{"container_number": R_A, "expected_index": 3}]
+    assert body["extra"] == []
+    _assert_reconcile_counts(body)
+
+    # 现场 3 次、预期 2 次：现场最后一次（索引 2）为 extra。
+    response = _reconcile([R_B, R_A], [R_A, R_B, R_A])
+    assert response.status_code == 200
+    body = response.json()
+    assert (body["matched_count"], body["missing_count"], body["extra_count"]) == (
+        2,
+        0,
+        1,
+    )
+    assert body["missing"] == []
+    assert body["extra"] == [{"container_number": R_A, "onsite_index": 2}]
+    _assert_reconcile_counts(body)
+
+
+def test_reconcile_shuffled_duplicated_samples_match_reference_and_conserve() -> None:
+    # 乱序及重复样例：与测试侧独立参考逐字段一致，且配对数量守恒。
+    samples = [
+        ([R_A, R_B, R_A, R_C, R_B], [R_B, R_A, R_C, R_A, R_B]),
+        ([R_A, R_A, R_B], [R_B, R_A, R_A]),
+        ([R_C, R_A, R_D, R_B, R_E], [R_E, R_B, R_D, R_A, R_D]),
+        ([R_A, R_B, R_C, R_A], [R_A, R_A, R_B, R_C]),
+        ([R_E, R_E, R_D, R_E, R_D], [R_D, R_E, R_D, R_E, R_E]),
+        ([R_A, R_B, R_C, R_D, R_E], [R_E, R_D, R_C, R_B, R_A]),
+    ]
+    for expected, onsite in samples:
+        response = _reconcile(expected, onsite)
+        assert response.status_code == 200, (expected, onsite, response.text)
+        body = response.json()
+        reference = _reference_reconcile(expected, onsite)
+        assert body["matched"] == reference["matched"], (expected, onsite)
+        assert body["missing"] == reference["missing"], (expected, onsite)
+        assert body["extra"] == reference["extra"], (expected, onsite)
+        _assert_reconcile_counts(body)
+        # 原索引序列不重不漏：预期索引恰好覆盖 0..n-1，现场索引同理。
+        assert sorted(
+            [m["expected_index"] for m in body["matched"]]
+            + [m["expected_index"] for m in body["missing"]]
+        ) == list(range(len(expected)))
+        assert sorted(
+            [m["onsite_index"] for m in body["matched"]]
+            + [x["onsite_index"] for x in body["extra"]]
+        ) == list(range(len(onsite)))
+
+
+def test_reconcile_invalid_structure_in_expected_list_rejected() -> None:
+    # 场景四（结构非法）：预期清单含小写箱号，整次核对拒绝，明确来源、
+    # 最小输入索引与原校验结论（结构错误）。
+    response = _reconcile([R_A, "csqu3054383"], [R_A])
+    assert response.status_code == 422
+    body = response.json()
+    assert body["status"] == "invalid_item"
+    assert body["expected_count"] == 2
+    assert body["onsite_count"] == 1
+    assert body["list_source"] == "expected"
+    assert body["index"] == 1
+    assert body["container_number"] == "csqu3054383"
+    assert body["error_code"] == "not_uppercase_letter"
+    assert body["position"] == 1
+    assert body["expected_check_digit"] is None
+    assert body["actual_check_digit"] is None
+    assert body["passed"] is False
+    # 拒绝负载不携带任何配对结果。
+    assert "matched" not in body
+    assert "missing" not in body
+    assert "extra" not in body
+
+
+def test_reconcile_invalid_structure_in_onsite_list_rejected() -> None:
+    # 现场清单的结构非法项（预期清单已全部有效）：来源 onsite。
+    response = _reconcile([R_A], [R_A, "CSQX3054383"])
+    assert response.status_code == 422
+    body = response.json()
+    assert body["status"] == "invalid_item"
+    assert body["list_source"] == "onsite"
+    assert body["index"] == 1
+    assert body["container_number"] == "CSQX3054383"
+    assert body["error_code"] == "invalid_category_identifier"
+    assert body["position"] == 4
+    assert body["expected_check_digit"] is None
+    assert body["actual_check_digit"] is None
+    assert body["passed"] is False
+
+
+def test_reconcile_check_digit_failure_rejected_with_original_verdict() -> None:
+    # 场景四（校验失败）：结构合法但末位不符，整次核对拒绝，结构字段为
+    # null，原校验结论以期望/实际校验位给出。
+    response = _reconcile([R_A], [R_A_BAD])
+    assert response.status_code == 422
+    body = response.json()
+    assert body["status"] == "invalid_item"
+    assert body["list_source"] == "onsite"
+    assert body["index"] == 0
+    assert body["container_number"] == R_A_BAD
+    assert body["error_code"] is None
+    assert body["position"] is None
+    assert body["message"] is None
+    assert body["expected_check_digit"] == 3
+    assert body["actual_check_digit"] == 4
+    assert body["passed"] is False
+
+
+def test_reconcile_expected_list_checked_before_onsite_list() -> None:
+    # 两侧都含无效项时先报预期清单（即使现场侧无效索引更小）。
+    response = _reconcile([R_A, "CSQX3054383"], ["!!", R_A])
+    assert response.status_code == 422
+    body = response.json()
+    assert body["status"] == "invalid_item"
+    assert body["list_source"] == "expected"
+    assert body["index"] == 1
+
+
+def test_reconcile_reuses_structure_source_minimum_index_wins() -> None:
+    # 与批量校验同一结构来源：最小无效索引、首个损坏位置、错误码一致。
+    response = _reconcile(["!!", "csqu3054383", R_A], [R_A])
+    assert response.status_code == 422
+    body = response.json()
+    assert body["index"] == 0
+    assert body["error_code"] == "invalid_length"
+    assert body["position"] == 3
+    assert body["list_source"] == "expected"
+
+
+def test_reconcile_request_shape_errors_return_standard_detail() -> None:
+    # 空清单、超过 100 项、字段类型错误、缺字段、多余字段：一律标准
+    # 422 detail，而不是业务负载 invalid_item。
+    empty = _reconcile([], [R_A])
+    assert empty.status_code == 422
+    assert "detail" in empty.json()
+    assert empty.json().get("status") != "invalid_item"
+
+    empty_onsite = _reconcile([R_A], [])
+    assert empty_onsite.status_code == 422
+    assert "detail" in empty_onsite.json()
+
+    too_many = _reconcile([R_A] * 101, [R_A])
+    assert too_many.status_code == 422
+    assert "detail" in too_many.json()
+
+    too_many_onsite = _reconcile([R_A], [R_A] * 101)
+    assert too_many_onsite.status_code == 422
+    assert "detail" in too_many_onsite.json()
+
+    wrong_type = _reconcile([R_A, 12345678901], [R_A])
+    assert wrong_type.status_code == 422
+    assert "detail" in wrong_type.json()
+
+    missing = client.post(
+        RECONCILE_ENDPOINT, json={"expected_container_numbers": [R_A]}
+    )
+    assert missing.status_code == 422
+    assert "detail" in missing.json()
+
+    extra = client.post(
+        RECONCILE_ENDPOINT,
+        json={
+            "expected_container_numbers": [R_A],
+            "onsite_container_numbers": [R_A],
+            "normalize": True,
+        },
+    )
+    assert extra.status_code == 422
+    assert "detail" in extra.json()
+
+
+def test_reconcile_boundary_sizes_one_and_one_hundred() -> None:
+    # 与批量校验一致的批量上限：每侧 1 与 100 项均接受。
+    one = _reconcile([R_A], [R_A])
+    assert one.status_code == 200
+    assert one.json()["matched_count"] == 1
+
+    hundred = _reconcile([R_A] * 100, [R_A] * 100)
+    assert hundred.status_code == 200
+    body = hundred.json()
+    assert body["matched_count"] == 100
+    assert body["missing_count"] == 0
+    assert body["extra_count"] == 0
+
+
+def test_reconcile_does_not_disturb_existing_endpoints() -> None:
+    # 引入核对入口后，原批量校验、纠错、明细路径与响应保持不变。
+    verify = client.post(VALID_ENDPOINT, json={"container_numbers": [R_A, R_A_BAD]})
+    assert verify.status_code == 200
+    assert [r["passed"] for r in verify.json()["results"]] == [True, False]
+
+    correct = client.post(
+        CORRECT_ENDPOINT, json={"container_number": "CSQX3054383"}
+    )
+    assert correct.status_code == 200
+    assert correct.json()["status"] == "unique"
+
+    explain = client.post(EXPLAIN_ENDPOINT, json={"container_number": R_A})
+    assert explain.status_code == 200
+    assert explain.json()["passed"] is True
+
+
+def test_reconcile_does_not_normalize_case_or_whitespace() -> None:
+    # 小写、前导空白一律不做归一化：结构非法即按业务负载拒绝。
+    lower = _reconcile(["csqu3054383"], [R_A])
+    assert lower.status_code == 422
+    assert lower.json()["error_code"] == "not_uppercase_letter"
+    assert lower.json()["position"] == 1
+
+    spaced = _reconcile([R_A], [" CSQU3054383"])  # 12 位
+    assert spaced.status_code == 422
+    body = spaced.json()
+    assert body["status"] == "invalid_item"
+    assert body["list_source"] == "onsite"
+    assert body["error_code"] == "invalid_length"
+    assert body["position"] == 12

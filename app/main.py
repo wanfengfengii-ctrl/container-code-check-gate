@@ -20,9 +20,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.checksum import (
+    ReconcileInvalidItem,
     correction_candidates,
     expected_check_digit,
     explain_check_digit,
+    reconcile_container_numbers,
     split_container_number,
     structure_error,
     summarize_by_owner,
@@ -37,9 +39,15 @@ from app.schemas import (
     CorrectionCandidateOut,
     ExplainRequest,
     ExplainResponse,
+    ExtraContainerOut,
     InvalidBatchResponse,
     InvalidContainerResponse,
+    MatchedContainerOut,
+    MissingContainerOut,
     OwnerSummaryOut,
+    ReconcileInvalidItemResponse,
+    ReconcileRequest,
+    ReconcileResponse,
     VerifyRequest,
     VerifyResponse,
 )
@@ -265,4 +273,77 @@ def explain_container_number(request: ExplainRequest) -> ExplainResponse | JSONR
         expected_check_digit=explanation.expected_check_digit,
         actual_check_digit=explanation.actual_check_digit,
         passed=explanation.passed,
+    )
+
+
+@app.post(
+    "/api/v1/container-numbers/reconcile",
+    response_model=ReconcileResponse,
+    summary="一次性清单核对：当班作业清单与现场扫描清单逐次配对",
+    responses={
+        422: {
+            "model": ReconcileInvalidItemResponse,
+            "description": (
+                "任一清单含结构非法或校验位不符的箱号：整次核对拒绝，"
+                "明确清单来源、最小输入索引与原校验结论。"
+            ),
+        }
+    },
+)
+def reconcile_container_lists(
+    request: ReconcileRequest,
+) -> ReconcileResponse | JSONResponse:
+    expected = request.expected_container_numbers
+    onsite = request.onsite_container_numbers
+
+    # 领域层先按各自输入顺序（预期优先）复用结构判定与校验位计算，
+    # 全部有效后才按完整箱号以重复次数逐次配对；路由只做编排与字段映射。
+    outcome = reconcile_container_numbers(expected, onsite)
+    if isinstance(outcome, ReconcileInvalidItem):
+        # 无效项拒绝：结构非法时结构字段取自与批量校验同一来源的
+        # StructureError，校验位字段为 null；校验位不符时反之。
+        error = outcome.structure_error
+        payload = ReconcileInvalidItemResponse(
+            expected_count=len(expected),
+            onsite_count=len(onsite),
+            list_source=outcome.list_source,
+            index=outcome.index,
+            container_number=outcome.container_number,
+            error_code=error.code if error is not None else None,
+            position=error.position if error is not None else None,
+            message=error.message if error is not None else None,
+            expected_check_digit=outcome.expected_check_digit,
+            actual_check_digit=outcome.actual_check_digit,
+            passed=False,
+        ).model_dump()
+        return SafeJSONResponse(status_code=422, content=payload)
+
+    return ReconcileResponse(
+        expected_count=outcome.expected_count,
+        onsite_count=outcome.onsite_count,
+        matched_count=outcome.matched_count,
+        missing_count=outcome.missing_count,
+        extra_count=outcome.extra_count,
+        matched=[
+            MatchedContainerOut(
+                container_number=item.container_number,
+                expected_index=item.expected_index,
+                onsite_index=item.onsite_index,
+            )
+            for item in outcome.matched
+        ],
+        missing=[
+            MissingContainerOut(
+                container_number=item.container_number,
+                expected_index=item.expected_index,
+            )
+            for item in outcome.missing
+        ],
+        extra=[
+            ExtraContainerOut(
+                container_number=item.container_number,
+                onsite_index=item.onsite_index,
+            )
+            for item in outcome.extra
+        ],
     )

@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections import deque
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 CONTAINER_LENGTH = 11
 CATEGORY_IDENTIFIERS = frozenset("UJZ")
@@ -341,3 +343,210 @@ def correction_candidates(container_number: str) -> list[CorrectionCandidate]:
             )
     candidates.sort(key=lambda c: (c.position, c.replacement_character))
     return candidates
+
+
+# --------------------------------------------------------------- 清单核对
+
+#: 清单来源标识：expected=当班作业清单（预期清单），onsite=现场扫描清单。
+EXPECTED_LIST: Literal["expected"] = "expected"
+ONSITE_LIST: Literal["onsite"] = "onsite"
+
+
+@dataclass(frozen=True)
+class ReconcileInvalidItem:
+    """导致整次核对被拒绝的无效箱号定位（结构非法或校验位不符）。
+
+    ``list_source`` 为 :data:`EXPECTED_LIST` / :data:`ONSITE_LIST`，指明
+    无效项来自哪一份清单；``index`` 为该项在该清单中的最小输入索引
+    （从 0 起）；``container_number`` 原样回显。``passed`` 恒为
+    ``False``，即原校验结论；无效原因有两种：
+
+    * 结构非法：``structure_error`` 为首个损坏位置（:class:`StructureError`，
+      与批量校验同一来源），``expected_check_digit`` /
+      ``actual_check_digit`` 均为 ``None``（结构非法时不做校验位复算）；
+    * 校验位不符：``structure_error`` 为 ``None``，两个校验位字段给出
+      原批量校验同口径的期望校验位与实际校验位。
+    """
+
+    list_source: Literal["expected", "onsite"]
+    index: int
+    container_number: str
+    structure_error: StructureError | None
+    expected_check_digit: int | None
+    actual_check_digit: int | None
+    passed: bool
+
+
+@dataclass(frozen=True)
+class MatchedContainer:
+    """一对成功配对的箱号（同一完整箱号在两侧各出现一次）。
+
+    ``expected_index`` / ``onsite_index`` 分别为其在预期清单与现场清单
+    中的原索引（从 0 起）。
+    """
+
+    container_number: str
+    expected_index: int
+    onsite_index: int
+
+
+@dataclass(frozen=True)
+class MissingContainer:
+    """预期清单中存在、但现场扫不到对应次数的箱号（预期侧差异）。"""
+
+    container_number: str
+    expected_index: int
+
+
+@dataclass(frozen=True)
+class ExtraContainer:
+    """现场清单中存在、但预期清单没有对应次数的箱号（现场侧差异）。"""
+
+    container_number: str
+    onsite_index: int
+
+
+@dataclass(frozen=True)
+class ReconcileResult:
+    """一次性清单核对结论（全部箱号结构合法且校验通过时才产生）。
+
+    配对以重复次数参与：同一箱号按出现次序逐次配成一对，超出另一侧
+    次数的部分才归入差异。因此一侧出现三次、另一侧两次时，只有**最后
+    一次**（按各自清单顺序）成为差异。
+
+    三个结果列表均保持对应清单中的先后顺序：
+
+    * ``matched``：按**预期清单**中被配对项的顺序；
+    * ``missing``：按**预期清单**顺序；
+    * ``extra``：按**现场清单**顺序。
+
+    配对数量守恒：``len(matched) + len(missing) == len(expected)`` 且
+    ``len(matched) + len(extra) == len(onsite)``。
+    """
+
+    expected_count: int
+    onsite_count: int
+    matched_count: int
+    missing_count: int
+    extra_count: int
+    matched: tuple[MatchedContainer, ...]
+    missing: tuple[MissingContainer, ...]
+    extra: tuple[ExtraContainer, ...]
+
+
+def _first_invalid_item(
+    expected: Sequence[str], onsite: Sequence[str]
+) -> ReconcileInvalidItem | None:
+    """按各自输入顺序找出首个无效箱号（先预期清单，后现场清单）。
+
+    每份清单内部按索引从小到大检查；只有预期清单全部有效后才开始检查
+    现场清单。结构判定复用 :func:`structure_error`，结构合法者再复用
+    :func:`expected_check_digit` 判断校验位，与批量校验同一来源、同一
+    口径。结构非法或校验位不符都使整次核对被拒绝。
+    """
+    for list_source, numbers in (
+        (EXPECTED_LIST, expected),
+        (ONSITE_LIST, onsite),
+    ):
+        for index, container_number in enumerate(numbers):
+            error = structure_error(container_number)
+            if error is not None:
+                return ReconcileInvalidItem(
+                    list_source=list_source,
+                    index=index,
+                    container_number=container_number,
+                    structure_error=error,
+                    expected_check_digit=None,
+                    actual_check_digit=None,
+                    passed=False,
+                )
+            expected_digit = expected_check_digit(container_number[:10])
+            actual_digit = int(container_number[10])
+            if expected_digit != actual_digit:
+                return ReconcileInvalidItem(
+                    list_source=list_source,
+                    index=index,
+                    container_number=container_number,
+                    structure_error=None,
+                    expected_check_digit=expected_digit,
+                    actual_check_digit=actual_digit,
+                    passed=False,
+                )
+    return None
+
+
+def reconcile_container_numbers(
+    expected: Sequence[str], onsite: Sequence[str]
+) -> ReconcileResult | ReconcileInvalidItem:
+    """把当班作业清单（预期）与现场扫描清单按完整箱号逐次配对。
+
+    调用方提交两份清单后：
+
+    1. **先校验**：按各自输入顺序（预期优先于现场，清单内按索引）复用
+       :func:`structure_error` 与 :func:`expected_check_digit` 逐项判断；
+       任一项结构非法或校验位不符，整次核对拒绝，返回
+       :class:`ReconcileInvalidItem`，指出清单来源、最小输入索引与原校验
+       结论（结构错误或校验位不符），不产生任何配对结果。
+    2. **后配对**：全部有效时，按完整箱号以重复次数逐次配对（FIFO）：
+       同一箱号的第 k 次出现与另一侧的第 k 次出现配成一对，超出另一侧
+       次数的最后若干次才归入差异——一侧三次、另一侧两次时，仅最后一次
+       成为差异。
+
+    返回 :class:`ReconcileResult`，其 ``matched`` 按预期清单顺序、
+    ``missing`` 按预期清单顺序、``extra`` 按现场清单顺序排列，并携带各
+    项在原清单中的索引。本函数不做任何大小写或空白归一化。
+    """
+    invalid = _first_invalid_item(expected, onsite)
+    if invalid is not None:
+        return invalid
+
+    # 现场清单按完整箱号建 FIFO 队列：同一箱号的多次出现按现场顺序排队，
+    # 预期清单逐项消费队首，实现“按重复次数逐次配对”。
+    onsite_queues: dict[str, deque[int]] = {}
+    for index, container_number in enumerate(onsite):
+        onsite_queues.setdefault(container_number, deque()).append(index)
+
+    matched: list[MatchedContainer] = []
+    missing: list[MissingContainer] = []
+    # 按预期顺序消费；未被消费的现场索引即多出项，稍后按现场顺序筛出。
+    consumed_onsite: set[int] = set()
+    for expected_index, container_number in enumerate(expected):
+        queue = onsite_queues.get(container_number)
+        if queue:
+            onsite_index = queue.popleft()
+            consumed_onsite.add(onsite_index)
+            matched.append(
+                MatchedContainer(
+                    container_number=container_number,
+                    expected_index=expected_index,
+                    onsite_index=onsite_index,
+                )
+            )
+        else:
+            missing.append(
+                MissingContainer(
+                    container_number=container_number,
+                    expected_index=expected_index,
+                )
+            )
+
+    # 现场侧未被任何预期项消费的出现即多出项；重扫现场清单以保持现场顺序。
+    extra = [
+        ExtraContainer(
+            container_number=container_number,
+            onsite_index=onsite_index,
+        )
+        for onsite_index, container_number in enumerate(onsite)
+        if onsite_index not in consumed_onsite
+    ]
+
+    return ReconcileResult(
+        expected_count=len(expected),
+        onsite_count=len(onsite),
+        matched_count=len(matched),
+        missing_count=len(missing),
+        extra_count=len(extra),
+        matched=tuple(matched),
+        missing=tuple(missing),
+        extra=tuple(extra),
+    )

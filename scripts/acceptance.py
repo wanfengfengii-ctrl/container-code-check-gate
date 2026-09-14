@@ -23,6 +23,7 @@ BASE_URL = os.environ.get("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 ENDPOINT = "/api/v1/container-numbers/verify"
 CORRECT_ENDPOINT = "/api/v1/container-numbers/correct"
 EXPLAIN_ENDPOINT = "/api/v1/container-numbers/explain"
+RECONCILE_ENDPOINT = "/api/v1/container-numbers/reconcile"
 
 
 # --------------------------------------------------------------- 参考实现
@@ -123,6 +124,48 @@ def hamming_distance(a: str, b: str) -> int:
     return sum(x != y for x, y in zip(a, b))
 
 
+def reference_reconcile(expected: list[str], onsite: list[str]) -> dict:
+    """一次性清单核对的独立参考实现：逐箱号收集两侧原索引，按出现次序
+    （第 k 次对第 k 次）对齐。与服务端 FIFO 队列实现刻意不同。
+
+    返回 matched/missing/extra 三个列表；matched/missing 按预期索引排序，
+    extra 按现场索引排序，对应契约规定的清单顺序。
+    """
+    epos: dict[str, list[int]] = {}
+    opos: dict[str, list[int]] = {}
+    for i, number in enumerate(expected):
+        epos.setdefault(number, []).append(i)
+    for i, number in enumerate(onsite):
+        opos.setdefault(number, []).append(i)
+
+    matched: list[dict] = []
+    missing: list[dict] = []
+    extra: list[dict] = []
+    for number, ep in epos.items():
+        op = opos.get(number, [])
+        k = min(len(ep), len(op))
+        matched.extend(
+            {
+                "container_number": number,
+                "expected_index": e,
+                "onsite_index": o,
+            }
+            for e, o in zip(ep[:k], op[:k])
+        )
+        missing.extend(
+            {"container_number": number, "expected_index": i} for i in ep[k:]
+        )
+    for number, op in opos.items():
+        ep = epos.get(number, [])
+        extra.extend(
+            {"container_number": number, "onsite_index": i} for i in op[len(ep) :]
+        )
+    matched.sort(key=lambda m: m["expected_index"])
+    missing.sort(key=lambda m: m["expected_index"])
+    extra.sort(key=lambda x: x["onsite_index"])
+    return {"matched": matched, "missing": missing, "extra": extra}
+
+
 # ----------------------------------------------------------------- HTTP
 
 
@@ -179,6 +222,33 @@ def call_explain_payload(payload: object) -> tuple[int, object]:
 
 def call_explain(number: object) -> tuple[int, object]:
     return call_explain_payload({"container_number": number})
+
+
+def call_reconcile_payload(payload: object) -> tuple[int, object]:
+    """以任意 JSON 负载调用一次性清单核对入口（用于形状断言）。"""
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        BASE_URL + RECONCILE_ENDPOINT,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+def call_reconcile(
+    expected: object, onsite: object
+) -> tuple[int, object]:
+    return call_reconcile_payload(
+        {
+            "expected_container_numbers": expected,
+            "onsite_container_numbers": onsite,
+        }
+    )
 
 
 def get_health() -> tuple[int, object]:
@@ -725,6 +795,238 @@ def run() -> int:
     )
     checks.expect("28f 开关类型错误 422", status, 422)
     checks.check("28g 开关类型错误 detail 形态", "detail" in body, str(body))
+
+    # ============================================ 一次性清单核对（换班交接）
+    # 用独立参考实现现场生成合法箱号，不写死被测服务常量。
+    RA = make_valid("CSQU305438")  # CSQU3054383
+    RB = make_valid("AAAU000006")  # AAAU0000060
+    RC = make_valid("BBBU000000")  # BBBU0000000
+    RD = make_valid("ABCU123456")  # ABCU1234560
+    RE_ = make_valid("MSCU635589")  # MSCU6355895
+    RA_BAD = "CSQU3054384"  # 结构合法但校验位不符（期望 3，实际 4）
+
+    def assert_conservation(prefix: str, body: dict, n_exp: int, n_on: int) -> None:
+        """配对数量守恒：计数与列表长度、两侧清单长度一致；原索引不重不漏。"""
+        checks.expect(
+            f"{prefix} matched_count 与列表一致",
+            body["matched_count"],
+            len(body["matched"]),
+        )
+        checks.expect(
+            f"{prefix} missing_count 与列表一致",
+            body["missing_count"],
+            len(body["missing"]),
+        )
+        checks.expect(
+            f"{prefix} extra_count 与列表一致",
+            body["extra_count"],
+            len(body["extra"]),
+        )
+        checks.expect(
+            f"{prefix} 配对+缺少=预期总数",
+            body["matched_count"] + body["missing_count"],
+            n_exp,
+        )
+        checks.expect(
+            f"{prefix} 配对+多出=现场总数",
+            body["matched_count"] + body["extra_count"],
+            n_on,
+        )
+        exp_idx = sorted(
+            [m["expected_index"] for m in body["matched"]]
+            + [m["expected_index"] for m in body["missing"]]
+        )
+        on_idx = sorted(
+            [m["onsite_index"] for m in body["matched"]]
+            + [x["onsite_index"] for x in body["extra"]]
+        )
+        checks.expect(f"{prefix} 预期原索引不重不漏", exp_idx, list(range(n_exp)))
+        checks.expect(f"{prefix} 现场原索引不重不漏", on_idx, list(range(n_on)))
+
+    # 29. 场景一：完全一致（乱序、含重复）——全部配对，无差异，原索引正确。
+    expected = [RA, RB, RA, RC]
+    onsite = [RC, RA, RB, RA]
+    status, body = call_reconcile(expected, onsite)
+    ref = reference_reconcile(expected, onsite)
+    checks.expect("29a 完全一致(乱序) 200", status, 200)
+    checks.expect("29b status=ok", body["status"], "ok")
+    checks.expect(
+        "29c 计数 4/0/0",
+        (body["matched_count"], body["missing_count"], body["extra_count"]),
+        (4, 0, 0),
+    )
+    checks.expect("29d 配对与独立参考一致", body["matched"], ref["matched"])
+    checks.expect("29e 缺少为空", body["missing"], [])
+    checks.expect("29f 多出为空", body["extra"], [])
+    assert_conservation("29g", body, len(expected), len(onsite))
+
+    # 30. 场景二：单侧缺失与现场多出并存（乱序），顺序与原索引正确。
+    expected = [RA, RB, RC]
+    onsite = [RD, RA, RB]  # 缺 RC，多 RD
+    status, body = call_reconcile(expected, onsite)
+    ref = reference_reconcile(expected, onsite)
+    checks.expect("30a 单侧缺失/多出 200", status, 200)
+    checks.expect(
+        "30b 计数 2/1/1",
+        (body["matched_count"], body["missing_count"], body["extra_count"]),
+        (2, 1, 1),
+    )
+    checks.expect("30c 配对与独立参考一致", body["matched"], ref["matched"])
+    checks.expect("30d 缺少与独立参考一致", body["missing"], ref["missing"])
+    checks.expect("30e 多出与独立参考一致", body["extra"], ref["extra"])
+    checks.expect(
+        "30f 缺少项按预期顺序带原索引",
+        body["missing"],
+        [{"container_number": RC, "expected_index": 2}],
+    )
+    checks.expect(
+        "30g 多出项按现场顺序带原索引",
+        body["extra"],
+        [{"container_number": RD, "onsite_index": 0}],
+    )
+    assert_conservation("30h", body, len(expected), len(onsite))
+
+    # 31. 场景三：重复次数不等——三次对两次时只有最后一次归入差异。
+    # 预期 3 次 RA、现场 2 次：预期最后一次（索引 3）为缺少。
+    expected = [RA, RB, RA, RA]
+    onsite = [RA, RA, RB]
+    status, body = call_reconcile(expected, onsite)
+    checks.expect("31a 预期3次现场2次 200", status, 200)
+    checks.expect(
+        "31b 计数 3/1/0",
+        (body["matched_count"], body["missing_count"], body["extra_count"]),
+        (3, 1, 0),
+    )
+    checks.expect("31c 与独立参考一致", body["matched"], reference_reconcile(expected, onsite)["matched"])
+    checks.expect(
+        "31d 仅最后一次(预期索引3)缺少",
+        body["missing"],
+        [{"container_number": RA, "expected_index": 3}],
+    )
+    assert_conservation("31e", body, len(expected), len(onsite))
+    # 现场 3 次、预期 2 次：现场最后一次（索引 2）为多出。
+    expected = [RB, RA]
+    onsite = [RA, RB, RA]
+    status, body = call_reconcile(expected, onsite)
+    checks.expect(
+        "31f 计数 2/0/1",
+        (body["matched_count"], body["missing_count"], body["extra_count"]),
+        (2, 0, 1),
+    )
+    checks.expect(
+        "31g 仅最后一次(现场索引2)多出",
+        body["extra"],
+        [{"container_number": RA, "onsite_index": 2}],
+    )
+    assert_conservation("31h", body, len(expected), len(onsite))
+
+    # 32. 乱序及重复组合样例：与独立参考逐字段一致，配对数量守恒。
+    shuffled_samples = [
+        ([RA, RB, RA, RC, RB], [RB, RA, RC, RA, RB]),
+        ([RA, RA, RB], [RB, RA, RA]),
+        ([RC, RA, RD, RB, RE_], [RE_, RB, RD, RA, RD]),
+        ([RA, RB, RC, RA], [RA, RA, RB, RC]),
+        ([RE_, RE_, RD, RE_, RD], [RD, RE_, RD, RE_, RE_]),
+        ([RA, RB, RC, RD, RE_], [RE_, RD, RC, RB, RA]),
+        ([RA, RA, RA], [RA, RA]),
+        ([RA, RA], [RA, RA, RA]),
+    ]
+    for si, (expected, onsite) in enumerate(shuffled_samples):
+        status, body = call_reconcile(expected, onsite)
+        prefix = f"32.{si}"
+        checks.expect(f"{prefix}a 样例 200", status, 200)
+        ref = reference_reconcile(expected, onsite)
+        checks.expect(f"{prefix}b 配对与独立参考一致", body["matched"], ref["matched"])
+        checks.expect(f"{prefix}c 缺少与独立参考一致", body["missing"], ref["missing"])
+        checks.expect(f"{prefix}d 多出与独立参考一致", body["extra"], ref["extra"])
+        assert_conservation(prefix + "e", body, len(expected), len(onsite))
+
+    # 33. 场景四：任一清单含结构非法或校验失败箱号——整次核对拒绝，
+    # 明确清单来源、最小输入索引与原校验结论。
+    status, body = call_reconcile([RA, "csqu3054383"], [RA])
+    checks.expect("33a 预期清单结构非法 422", status, 422)
+    checks.expect("33b status=invalid_item", body["status"], "invalid_item")
+    checks.expect("33c 来源 expected", body["list_source"], "expected")
+    checks.expect("33d 最小输入索引=1", body["index"], 1)
+    checks.expect("33e 原样回显", body["container_number"], "csqu3054383")
+    checks.expect("33f 原校验结论-结构错误码", body["error_code"], "not_uppercase_letter")
+    checks.expect("33g 原校验结论-首个损坏位置", body["position"], 1)
+    checks.expect("33h 结构非法时校验位为空", body["expected_check_digit"], None)
+    checks.expect("33i 结构非法时实际校验位为空", body["actual_check_digit"], None)
+    checks.expect("33j passed=false", body["passed"], False)
+    checks.check("33k 不返回任何配对结果", "matched" not in body, str(body))
+
+    status, body = call_reconcile([RA], [RA, "CSQX3054383"])
+    checks.expect("33l 现场清单结构非法 422", status, 422)
+    checks.expect("33m 来源 onsite", body["list_source"], "onsite")
+    checks.expect("33n 最小输入索引=1", body["index"], 1)
+    checks.expect("33o 错误码", body["error_code"], "invalid_category_identifier")
+    checks.expect("33p 损坏位置=4", body["position"], 4)
+
+    # 校验位不符（结构合法）：结构字段为空，原校验结论以期望/实际校验位给出。
+    status, body = call_reconcile([RA], [RA_BAD])
+    checks.expect("33q 校验位不符 422", status, 422)
+    checks.expect("33r 来源 onsite", body["list_source"], "onsite")
+    checks.expect("33s 最小输入索引=0", body["index"], 0)
+    checks.expect("33t 结构字段为空", body["error_code"], None)
+    checks.expect("33u 原结论期望校验位=3", body["expected_check_digit"], 3)
+    checks.expect("33v 原结论实际校验位=4", body["actual_check_digit"], 4)
+    checks.expect("33w passed=false", body["passed"], False)
+
+    # 两侧均无效时先报预期清单（即使现场侧索引更小）；清单内取最小索引。
+    status, body = call_reconcile([RA, "CSQX3054383"], ["!!", RA])
+    checks.expect("33x 先查预期清单", body["list_source"], "expected")
+    checks.expect("33y 预期侧最小索引=1", body["index"], 1)
+    status, body = call_reconcile(["!!", "csqu3054383", RA], [RA])
+    checks.expect("33z 清单内最小索引=0", body["index"], 0)
+    checks.expect("33aa 越界位置=3", body["position"], 3)
+
+    # 34. 请求形状：空清单、超 100、类型错误、缺字段、多余字段 -> 标准 422 detail；
+    # 边界 1 与 100 接受。
+    for label, payload in [
+        ("34a 预期空清单", {"expected_container_numbers": [], "onsite_container_numbers": [RA]}),
+        ("34b 现场空清单", {"expected_container_numbers": [RA], "onsite_container_numbers": []}),
+        ("34c 预期超100", {"expected_container_numbers": [RA] * 101, "onsite_container_numbers": [RA]}),
+        ("34d 现场超100", {"expected_container_numbers": [RA], "onsite_container_numbers": [RA] * 101}),
+        ("34e 元素类型错误", {"expected_container_numbers": [12345678901], "onsite_container_numbers": [RA]}),
+        ("34f 缺现场字段", {"expected_container_numbers": [RA]}),
+        (
+            "34g 多余字段",
+            {
+                "expected_container_numbers": [RA],
+                "onsite_container_numbers": [RA],
+                "normalize": True,
+            },
+        ),
+    ]:
+        status, body = call_reconcile_payload(payload)
+        checks.expect(f"{label} 422", status, 422)
+        checks.check(f"{label} detail 形态", "detail" in body, str(body))
+
+    status, body = call_reconcile([RA], [RA])
+    checks.expect("34h 单侧1项 200", status, 200)
+    checks.expect("34i 配对1项", body["matched_count"], 1)
+    status, body = call_reconcile([RA] * 100, [RA] * 100)
+    checks.expect("34j 单侧100项 200", status, 200)
+    checks.expect("34k 配对100项", body["matched_count"], 100)
+
+    # 35. 旧接口回归：核对入口引入后批量校验、纠错、明细路径与响应不变。
+    status, body = call_api(["CSQU3054383", "CSQU3054384"])
+    checks.expect("35a 批量校验仍 200", status, 200)
+    checks.expect(
+        "35b 逐项通过标志不变",
+        [r["passed"] for r in body["results"]],
+        [True, False],
+    )
+    status, body = call_api(["CSQU3054383", "csqu3054383"])
+    checks.expect("35c 批量非法批仍 422", status, 422)
+    checks.expect("35d 旧接口最小非法索引", body["index"], 1)
+    status, body = call_correct("CSQX3054383")
+    checks.expect("35e 纠错入口仍 200", status, 200)
+    checks.expect("35f 纠错状态仍 unique", body["status"], "unique")
+    status, body = call_explain("CSQU3054383")
+    checks.expect("35g 明细入口仍 200", status, 200)
+    checks.expect("35h 明细结论仍 passed", body["passed"], True)
 
     return _report(checks)
 
