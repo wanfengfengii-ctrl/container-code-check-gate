@@ -1,11 +1,15 @@
 # 闸口箱号校验 API —— Compose 编排。
 #
+# 镜像只由 api 构建一次；verify 仅按名称复用同一镜像、不重复声明 build，
+# 否则两个服务并行构建并写同一个镜像标签会发生命名冲突，导致构建失败。
+#
 # 常驻服务只有 api 一个（“Docker Compose 只运行 API”）：
 #   docker compose up --build
 #   API_PORT=18080 docker compose up --build      # 覆盖宿主端口
 #
 # verify 是一次性验收任务，置于 acceptance profile 下，
-# 因此不会随 `docker compose up` 常驻启动：
+# 因此不会随 `docker compose up` 常驻启动（先构建一次镜像）：
+#   docker compose build api
 #   docker compose --profile acceptance run --rm verify
 
 services:
@@ -18,10 +22,11 @@ services:
       - "${API_PORT:-8000}:8000"
     restart: unless-stopped
 
-  # 一次性验收：对 api 做端到端断言后退出（退出码 0 即通过）。
+  # 一次性验收：复用 api 镜像（内含 scripts/acceptance.py），对 api 做
+  # 端到端断言后退出（退出码 0 即通过）。本服务不声明 build，避免与 api
+  # 并行构建时争抢同一镜像标签。
   verify:
     profiles: ["acceptance"]
-    build: .
     image: container-check-api:latest
     depends_on:
       api:

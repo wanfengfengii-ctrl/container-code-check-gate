@@ -169,14 +169,21 @@ curl -s -X POST .../verify -H 'Content-Type: application/json' -d '{"container_n
 ## 一次性验收服务 `verify`
 
 `verify` 位于 `acceptance` profile 下，**不**随 `docker compose up` 常驻；
-它等 API 健康后用内置的独立参考实现（不复用被测代码）做端到端断言，
-打印每条 PASS/FAIL 并以退出码表达结果：
+镜像只由 `api` 构建一次，`verify` 按名称复用同一镜像（不重复声明 `build`，
+避免两个服务并行构建时争抢同一镜像标签）。它等 API 健康后用内置的独立
+参考实现（不复用被测代码）做端到端断言，打印每条 PASS/FAIL 并以退出码
+表达结果：
 
 ```bash
-docker compose up --build -d api
+# 方式一：分别构建与运行
+docker compose build api
 docker compose --profile acceptance run --rm verify
 # 末尾输出 "ACCEPTANCE PASSED" 且退出码 0 即验收通过
 docker compose down
+
+# 方式二：一条命令完成构建、起服务、验收并按验收码退出
+docker compose --profile acceptance up --build \
+  --abort-on-container-exit --exit-code-from verify
 ```
 
 ## 目录结构
