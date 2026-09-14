@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import string
 
 import pytest
@@ -16,8 +17,10 @@ from app.checksum import (
     CONTAINER_LENGTH,
     LETTER_VALUES,
     character_value,
+    checksum_steps,
     correction_candidates,
     expected_check_digit,
+    explain_check_digit,
     letter_value,
     split_container_number,
     structure_error,
@@ -273,3 +276,101 @@ def test_correction_candidates_require_exact_length() -> None:
     for bad in ("CSQU305438", "CSQU30543834", "", " CSQU3054383"):
         with pytest.raises(ValueError):
             correction_candidates(bad)
+
+
+# ---------------------------------------------------------------- 计算明细
+
+
+def test_checksum_steps_known_sample_ten_products() -> None:
+    # ISO 6346 经典样例 CSQU305438 的十项乘积逐项钉死。
+    steps = checksum_steps("CSQU305438")
+    assert len(steps) == 10
+    assert [s.position for s in steps] == list(range(1, 11))
+    assert [s.character for s in steps] == list("CSQU305438")
+    assert [s.value for s in steps] == [13, 30, 28, 32, 3, 0, 5, 4, 3, 8]
+    assert [s.weight for s in steps] == [2**i for i in range(10)]
+    assert [s.product for s in steps] == [
+        13,
+        60,
+        112,
+        256,
+        48,
+        0,
+        320,
+        512,
+        768,
+        4096,
+    ]
+
+
+def test_checksum_steps_weight_is_power_of_two_by_position() -> None:
+    steps = checksum_steps("AAAU000006")
+    for step in steps:
+        assert step.weight == 2 ** (step.position - 1)
+        assert step.product == step.value * step.weight
+
+
+def test_checksum_steps_are_immutable() -> None:
+    step = checksum_steps("CSQU305438")[0]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        step.product = 0  # type: ignore[misc]
+    explanation = explain_check_digit("CSQU3054383")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        explanation.weighted_sum = 0  # type: ignore[misc]
+
+
+def test_weighted_sum_is_aggregated_from_steps() -> None:
+    # 加权和必须由步骤乘积求和得到，二者不得各算一套。
+    for prefix in ("CSQU305438", "AAAU000006", "AAAU000008", "MSCU635589"):
+        steps = checksum_steps(prefix)
+        assert weighted_sum(prefix) == sum(s.product for s in steps)
+
+
+def test_explain_aggregates_everything_from_steps() -> None:
+    explanation = explain_check_digit("CSQU3054383")
+    assert explanation.container_number == "CSQU3054383"
+    assert explanation.steps == checksum_steps("CSQU305438")
+    assert explanation.weighted_sum == sum(s.product for s in explanation.steps)
+    assert explanation.weighted_sum == weighted_sum("CSQU305438") == 6185
+    assert explanation.remainder == 6185 % 11 == 3
+    assert explanation.expected_check_digit == expected_check_digit("CSQU305438")
+    assert explanation.actual_check_digit == 3
+    assert explanation.passed is True
+
+
+def test_explain_remainder_ten_folds_to_zero() -> None:
+    explanation = explain_check_digit("AAAU0000060")
+    assert explanation.weighted_sum == 3398
+    assert explanation.remainder == 10  # 原始余数保留 10，不在明细层折叠
+    assert explanation.expected_check_digit == 0
+    assert explanation.actual_check_digit == 0
+    assert explanation.passed is True
+
+
+def test_explain_remainder_zero_stays_zero() -> None:
+    explanation = explain_check_digit("AAAU0000080")
+    assert explanation.weighted_sum == 4422
+    assert explanation.remainder == 0
+    assert explanation.expected_check_digit == 0
+    assert explanation.passed is True
+
+
+def test_explain_always_agrees_with_original_check_functions() -> None:
+    # 明细合计与结论必须始终等于原校验函数的结果（含被篡改的末位）。
+    for serial in range(300):
+        prefix = "AAAU" + f"{serial:06d}"
+        expected = expected_check_digit(prefix)
+        for check in {expected, (expected + 1) % 10}:
+            number = f"{prefix}{check}"
+            explanation = explain_check_digit(number)
+            assert explanation.weighted_sum == weighted_sum(prefix)
+            assert explanation.remainder == weighted_sum(prefix) % 11
+            assert explanation.expected_check_digit == expected
+            assert explanation.actual_check_digit == check
+            assert explanation.passed is (expected == check)
+
+
+def test_explain_requires_exact_length() -> None:
+    for bad in ("CSQU305438", "CSQU30543834", "", " CSQU3054383"):
+        with pytest.raises(ValueError):
+            explain_check_digit(bad)

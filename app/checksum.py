@@ -50,20 +50,107 @@ def character_value(char: str) -> int:
     return LETTER_VALUES[char]
 
 
+@dataclass(frozen=True)
+class ChecksumStep:
+    """前 10 位中单个字符的加权计算步骤（不可变）。
+
+    ``position`` 从 1 起计，与 :class:`StructureError` 的位置口径一致；
+    ``weight`` 为 ``2 ** (position - 1)``；``product`` 为
+    ``value * weight``。现场复核时按此逐步骤对账。
+    """
+
+    position: int
+    character: str
+    value: int
+    weight: int
+    product: int
+
+
+def checksum_steps(first_ten: str) -> tuple[ChecksumStep, ...]:
+    """把参与加权的字符逐位展开为不可变计算步骤（按原位置顺序）。
+
+    这是加权计算的唯一来源：:func:`weighted_sum` 与
+    :func:`explain_check_digit` 的汇总值都由这些步骤的 ``product``
+    求和得到，避免明细与校验各算一套而产生分歧。
+    """
+    steps: list[ChecksumStep] = []
+    for index, char in enumerate(first_ten):
+        value = character_value(char)
+        weight = 2 ** index
+        steps.append(
+            ChecksumStep(
+                position=index + 1,
+                character=char,
+                value=value,
+                weight=weight,
+                product=value * weight,
+            )
+        )
+    return tuple(steps)
+
+
 def weighted_sum(first_ten: str) -> int:
-    """对前 10 位字符按 2**0 .. 2**9 加权求和。"""
-    return sum(
-        character_value(char) * (2 ** position)
-        for position, char in enumerate(first_ten)
-    )
+    """对前 10 位字符按 2**0 .. 2**9 加权求和（由计算步骤汇总）。"""
+    return sum(step.product for step in checksum_steps(first_ten))
+
+
+def _check_digit_from_remainder(remainder: int) -> int:
+    """把取模余数折叠为期望校验位：余数 10 记为 0，其余余数原样。"""
+    if remainder == REMAINDER_FOR_ZERO_DIGIT:
+        return 0
+    return remainder
 
 
 def expected_check_digit(first_ten: str) -> int:
     """由前 10 位计算期望校验位（余数 10 折叠为 0）。"""
-    remainder = weighted_sum(first_ten) % MODULUS
-    if remainder == REMAINDER_FOR_ZERO_DIGIT:
-        return 0
-    return remainder
+    return _check_digit_from_remainder(weighted_sum(first_ten) % MODULUS)
+
+
+@dataclass(frozen=True)
+class ChecksumExplanation:
+    """单箱校验位计算的完整明细：不可变步骤序列与由步骤派生的汇总。
+
+    ``weighted_sum`` 是 ``steps`` 各项 ``product`` 之和，``remainder``
+    是合计对 11 的余数，``expected_check_digit`` 是余数折叠结果；与
+    :func:`weighted_sum`、:func:`expected_check_digit` 同源同口径。
+    """
+
+    container_number: str
+    steps: tuple[ChecksumStep, ...]
+    weighted_sum: int
+    remainder: int
+    expected_check_digit: int
+    actual_check_digit: int
+    passed: bool
+
+
+def explain_check_digit(container_number: str) -> ChecksumExplanation:
+    """生成单箱逐字符计算明细，供校验结论争议时现场复核。
+
+    输入必须恰为 11 位且结构合法（路由层以 :func:`structure_error`
+    把关）；不做任何大小写或空白归一化。汇总值全部由本次生成的步骤
+    求和、取模、折叠得到，保证明细与结论永远一致。
+    """
+    if len(container_number) != CONTAINER_LENGTH:
+        raise ValueError(
+            f"container number must be exactly {CONTAINER_LENGTH} "
+            f"characters, got {len(container_number)}"
+        )
+
+    steps = checksum_steps(container_number[:10])
+    total = sum(step.product for step in steps)
+    remainder = total % MODULUS
+    expected = _check_digit_from_remainder(remainder)
+    actual = int(container_number[10])
+    return ChecksumExplanation(
+        container_number=container_number,
+        steps=steps,
+        weighted_sum=total,
+        remainder=remainder,
+        expected_check_digit=expected,
+        actual_check_digit=actual,
+        passed=expected == actual,
+    )
 
 
 @dataclass(frozen=True)

@@ -38,6 +38,32 @@ def _reference_weighted_sum(first_ten: str) -> int:
 
 VALID_ENDPOINT = "/api/v1/container-numbers/verify"
 CORRECT_ENDPOINT = "/api/v1/container-numbers/correct"
+EXPLAIN_ENDPOINT = "/api/v1/container-numbers/explain"
+
+
+def _reference_steps(first_ten: str) -> list[dict[str, Any]]:
+    """测试侧独立参考实现：逐位置字符、映射值、二次幂权重与乘积。"""
+    values: dict[str, int] = {}
+    nxt = 10
+    for letter in string.ascii_uppercase:
+        values[letter] = nxt
+        nxt += 1
+        if nxt % 11 == 0:
+            nxt += 1
+    steps: list[dict[str, Any]] = []
+    for index, char in enumerate(first_ten):
+        value = int(char) if char.isdigit() else values[char]
+        weight = 2**index
+        steps.append(
+            {
+                "position": index + 1,
+                "character": char,
+                "value": value,
+                "weight": weight,
+                "product": value * weight,
+            }
+        )
+    return steps
 
 
 def _hamming_distance(a: str, b: str) -> int:
@@ -440,3 +466,144 @@ def test_verify_then_correct_flow_and_verify_regression() -> None:
         c["container_number"] == "CSQU3054383"
         for c in correction.json()["candidates"]
     )
+
+
+# ---------------------------------------------------------- 单箱计算明细
+
+
+def test_explain_known_sample_ten_products() -> None:
+    # 已知样例 CSQU3054383：十项乘积逐项钉死，并与独立参考实现逐步骤对比。
+    response = client.post(EXPLAIN_ENDPOINT, json={"container_number": "CSQU3054383"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["container_number"] == "CSQU3054383"
+    assert body["steps"] == _reference_steps("CSQU305438")
+    assert len(body["steps"]) == 10
+    assert [s["product"] for s in body["steps"]] == [
+        13,
+        60,
+        112,
+        256,
+        48,
+        0,
+        320,
+        512,
+        768,
+        4096,
+    ]
+    assert body["weighted_sum"] == 6185
+    assert body["remainder"] == 3
+    assert body["expected_check_digit"] == 3
+    assert body["actual_check_digit"] == 3
+    assert body["passed"] is True
+
+
+def test_explain_remainder_ten_folds_to_zero() -> None:
+    # AAAU000006 加权和 3398，余数 10 -> 期望校验位 0；余数本身原样呈现。
+    good = client.post(EXPLAIN_ENDPOINT, json={"container_number": "AAAU0000060"})
+    assert good.status_code == 200
+    body = good.json()
+    assert body["weighted_sum"] == 3398
+    assert body["remainder"] == 10
+    assert body["expected_check_digit"] == 0
+    assert body["actual_check_digit"] == 0
+    assert body["passed"] is True
+
+    bad = client.post(EXPLAIN_ENDPOINT, json={"container_number": "AAAU0000065"})
+    assert bad.status_code == 200
+    bad_body = bad.json()
+    assert bad_body["remainder"] == 10
+    assert bad_body["expected_check_digit"] == 0
+    assert bad_body["actual_check_digit"] == 5
+    assert bad_body["passed"] is False
+
+
+def test_explain_remainder_zero_boundary() -> None:
+    response = client.post(EXPLAIN_ENDPOINT, json={"container_number": "AAAU0000080"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["weighted_sum"] == 4422
+    assert body["remainder"] == 0
+    assert body["expected_check_digit"] == 0
+    assert body["passed"] is True
+
+
+def test_explain_structure_error_reuses_first_damage_position() -> None:
+    # 结构损坏：与批量校验同一来源的首个损坏位置与错误代码，业务负载 422。
+    cases = [
+        ("csqu3054383", "not_uppercase_letter", 1),     # 小写，绝不归一化
+        ("CSQX3054383", "invalid_category_identifier", 4),
+        ("CSQU30543A3", "not_digit", 10),
+        ("CSQU305438A", "not_digit", 11),
+        ("CSQU305438", "invalid_length", 11),           # 仅 10 位
+        (" CSQU3054383", "invalid_length", 12),         # 前导空白不去除
+        ("CSQU3054383 ", "invalid_length", 12),         # 尾随空白不去除
+    ]
+    for number, code, position in cases:
+        response = client.post(EXPLAIN_ENDPOINT, json={"container_number": number})
+        assert response.status_code == 422, number
+        body = response.json()
+        assert body["status"] == "invalid_container"
+        assert body["container_number"] == number  # 原样回显，不做任何纠正
+        assert body["error_code"] == code
+        assert body["position"] == position
+        assert "steps" not in body
+
+
+def test_explain_request_shape_errors_are_422() -> None:
+    missing = client.post(EXPLAIN_ENDPOINT, json={})
+    assert missing.status_code == 422
+    assert "detail" in missing.json()
+
+    wrong_type = client.post(EXPLAIN_ENDPOINT, json={"container_number": 12345678901})
+    assert wrong_type.status_code == 422
+    assert "detail" in wrong_type.json()
+
+    extra = client.post(
+        EXPLAIN_ENDPOINT,
+        json={"container_number": "CSQU3054383", "normalize": True},
+    )
+    assert extra.status_code == 422
+    assert "detail" in extra.json()
+
+
+def test_explain_totals_and_verdict_always_match_verify() -> None:
+    # 调用方从批量结果中任取箱号提交明细：合计与结论必须等于原校验结果。
+    numbers = [
+        "CSQU3054383",  # 通过
+        "CSQU3054384",  # 末位不符
+        "AAAU0000060",  # 余数 10 折 0
+        "AAAU0000081",  # 余数 0 但末位不符
+    ]
+    verify = client.post(VALID_ENDPOINT, json={"container_numbers": numbers})
+    assert verify.status_code == 200
+    for result in verify.json()["results"]:
+        explain = client.post(
+            EXPLAIN_ENDPOINT, json={"container_number": result["container_number"]}
+        )
+        assert explain.status_code == 200
+        body = explain.json()
+        # 明细合计由十项乘积求和，且与批量结果同名字段一致。
+        steps_total = sum(s["product"] for s in body["steps"])
+        assert steps_total == body["weighted_sum"] == result["weighted_sum"]
+        assert body["remainder"] == result["weighted_sum"] % 11
+        assert body["expected_check_digit"] == result["expected_check_digit"]
+        assert body["actual_check_digit"] == result["actual_check_digit"]
+        assert body["passed"] == result["passed"]
+
+
+def test_verify_and_correct_regression_after_explain_added() -> None:
+    # 旧接口回归：批量校验与单箱纠错的路径、请求及响应保持兼容。
+    verify = client.post(
+        VALID_ENDPOINT,
+        json={"container_numbers": ["CSQU3054383", "csqu3054383"]},
+    )
+    assert verify.status_code == 422
+    assert verify.json()["status"] == "invalid_batch"
+    assert verify.json()["index"] == 1
+
+    correct = client.post(CORRECT_ENDPOINT, json={"container_number": "CSQX3054383"})
+    assert correct.status_code == 200
+    assert correct.json()["status"] == "unique"
+    assert correct.json()["candidates"][0]["container_number"] == "CSQU3054383"

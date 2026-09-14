@@ -19,17 +19,22 @@ from fastapi.responses import JSONResponse
 from app.checksum import (
     correction_candidates,
     expected_check_digit,
+    explain_check_digit,
     split_container_number,
     structure_error,
     weighted_sum,
 )
 from app.schemas import (
+    ChecksumStepOut,
     ContainerPartsOut,
     ContainerResult,
     CorrectRequest,
     CorrectResponse,
     CorrectionCandidateOut,
+    ExplainRequest,
+    ExplainResponse,
     InvalidBatchResponse,
+    InvalidContainerResponse,
     VerifyRequest,
     VerifyResponse,
 )
@@ -145,4 +150,54 @@ def correct_container_number(request: CorrectRequest) -> CorrectResponse:
             )
             for c in candidates
         ],
+    )
+
+
+@app.post(
+    "/api/v1/container-numbers/explain",
+    response_model=ExplainResponse,
+    summary="单箱逐字符计算明细（校验结论争议时供现场复核）",
+    responses={
+        422: {
+            "model": InvalidContainerResponse,
+            "description": (
+                "箱号结构非法：返回首个损坏位置与错误代码，"
+                "与批量校验的结构判定同一来源。"
+            ),
+        }
+    },
+)
+def explain_container_number(request: ExplainRequest) -> ExplainResponse | JSONResponse:
+    # 结构非法：沿用与批量校验相同的 structure_error 判定，
+    # 以业务负载返回首个损坏位置与错误代码（不尝试纠正输入）。
+    error = structure_error(request.container_number)
+    if error is not None:
+        payload = InvalidContainerResponse(
+            container_number=request.container_number,
+            error_code=error.code,
+            position=error.position,
+            message=error.message,
+        ).model_dump()
+        return JSONResponse(status_code=422, content=payload)
+
+    # 结构合法：领域层生成不可变步骤明细，汇总值由步骤求和派生；
+    # 路由与响应模型只做字段映射，不另行计算。
+    explanation = explain_check_digit(request.container_number)
+    return ExplainResponse(
+        container_number=explanation.container_number,
+        steps=[
+            ChecksumStepOut(
+                position=step.position,
+                character=step.character,
+                value=step.value,
+                weight=step.weight,
+                product=step.product,
+            )
+            for step in explanation.steps
+        ],
+        weighted_sum=explanation.weighted_sum,
+        remainder=explanation.remainder,
+        expected_check_digit=explanation.expected_check_digit,
+        actual_check_digit=explanation.actual_check_digit,
+        passed=explanation.passed,
     )

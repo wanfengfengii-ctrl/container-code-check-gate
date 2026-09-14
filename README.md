@@ -3,7 +3,8 @@
 纯后端服务：批量复算集装箱箱号的 ISO 6346 风格校验位，让闸口在放行前
 得到**可复算**的结论。手抄箱号错一位时，末位校验码对不上，服务会逐箱
 标出期望校验位、实际校验位与加权和；对未通过的箱号，还可提交单箱纠错
-入口，枚举“只差一个字符”的合法候选号。
+入口，枚举“只差一个字符”的合法候选号；对校验结论有争议时，可提交单箱
+计算明细入口，逐字符还原映射值、权重与乘积的完整计算过程供现场复核。
 
 - 运行时：Python 3.12、FastAPI、Pydantic v2、Uvicorn
 - 无数据库、无外部依赖；字符映射与加权计算逻辑见 `app/checksum.py`
@@ -217,11 +218,70 @@ curl -s -X POST http://localhost:8000/api/v1/container-numbers/correct \
 每个候选给出差异位置、原字符、新字符与完整候选号，候选生成复用与批量
 校验相同的字符映射、结构判定与校验位计算。
 
+## 单箱计算明细（争议时现场复核）
+
+当闸口人员对某只箱号的校验结论有争议时，调用方可从批量结果中取出该
+**结构合法**的箱号，提交到明细入口，把逐字符计算过程交给现场复核：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/container-numbers/explain \
+  -H 'Content-Type: application/json' \
+  -d '{"container_number": "CSQU3054383"}'
+```
+
+端点：`POST /api/v1/container-numbers/explain`
+请求体：`{"container_number": "..."}`，原样使用，不做大小写或空白
+归一化（字段缺失、类型错误、多余字段按请求校验返回 422 `detail`）。
+
+响应按原位置给出前 10 位每一位的字符、映射值、二次幂权重与乘积，
+并给出乘积合计、取模结果（未折叠的原始余数）、期望与实际校验位：
+
+```json
+{
+  "status": "ok",
+  "container_number": "CSQU3054383",
+  "steps": [
+    {"position": 1, "character": "C", "value": 13, "weight": 1, "product": 13},
+    {"position": 2, "character": "S", "value": 30, "weight": 2, "product": 60},
+    {"position": 10, "character": "8", "value": 8, "weight": 512, "product": 4096}
+  ],
+  "weighted_sum": 6185,
+  "remainder": 3,
+  "expected_check_digit": 3,
+  "actual_check_digit": 3,
+  "passed": true
+}
+```
+
+（上例省略了中间 7 个步骤；`position` 从 1 起计，`weight` 为
+`2**(position-1)`，`product = value * weight`。）
+
+`weighted_sum` 由 `steps` 的十项乘积求和得到，`remainder` 是合计对 11
+的原始余数（余数 10 时原样呈现为 10，折叠后的期望校验位为 0），
+`expected_check_digit` / `actual_check_digit` / `passed` 与批量校验结果
+同名字段永远一致——明细与校验共用同一份领域算法（不可变步骤对象），
+不存在两套各算各的口径。
+
+箱号结构损坏时返回 422 业务负载（`status=invalid_container`），沿用与
+批量校验相同的错误代码与首个损坏位置：
+
+```json
+{
+  "status": "invalid_container",
+  "container_number": "csqu3054383",
+  "error_code": "not_uppercase_letter",
+  "position": 1,
+  "message": "character at position 1 must be an uppercase letter A-Z (no case normalization is applied)"
+}
+```
+
 ## 测试
 
 字符映射跳号、加权位置敏感性、全部 11 种余数边界（含余 10→0、余 0→0）、
 结构首损定位、批量边界与两类 422 的区分均有覆盖；纠错入口以独立汉明
-距离枚举断言唯一候选、歧义候选、无候选及旧接口回归：
+距离枚举断言唯一候选、歧义候选、无候选及旧接口回归；明细入口以独立
+参考实现断言已知样例的十项乘积、余数十折零边界、结构错误定位，并逐箱
+确认明细合计与结论始终等于批量校验结果：
 
 ```bash
 .venv/bin/pip install -r requirements-dev.txt
@@ -252,12 +312,12 @@ docker compose --profile acceptance up --build \
 
 ```
 app/
-  checksum.py     # 字符映射、加权和、期望校验位、结构判定、纠错候选（独立可测）
+  checksum.py     # 字符映射、加权和、期望校验位、结构判定、纠错候选、计算明细（独立可测）
   schemas.py      # Pydantic 请求/响应模型
-  main.py         # FastAPI 路由：整批结构校验 + 逐项复算 + 单箱纠错
+  main.py         # FastAPI 路由：整批结构校验 + 逐项复算 + 单箱纠错 + 单箱明细
 tests/
   test_checksum.py  # 映射跳号与余数边界等单元测试
-  test_api.py       # API 端到端测试（含纠错入口独立汉明距离断言）
+  test_api.py       # API 端到端测试（含纠错、明细入口的独立参考断言）
 scripts/
   acceptance.py     # verify 一次性验收脚本（仅用标准库）
 docker-compose.yml  # 仅 api 常驻；verify 为一次性任务

@@ -22,6 +22,7 @@ import urllib.request
 BASE_URL = os.environ.get("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 ENDPOINT = "/api/v1/container-numbers/verify"
 CORRECT_ENDPOINT = "/api/v1/container-numbers/correct"
+EXPLAIN_ENDPOINT = "/api/v1/container-numbers/explain"
 
 
 # --------------------------------------------------------------- 参考实现
@@ -49,6 +50,24 @@ def reference_check_digit(first_ten: str) -> tuple[int, int]:
     )
     remainder = total % 11
     return total, (0 if remainder == 10 else remainder)
+
+
+def reference_steps(first_ten: str) -> list[dict]:
+    """独立参考实现：逐位置字符、映射值、二次幂权重与乘积。"""
+    steps: list[dict] = []
+    for index, char in enumerate(first_ten):
+        value = int(char) if char.isdigit() else LETTERS[char]
+        weight = 2**index
+        steps.append(
+            {
+                "position": index + 1,
+                "character": char,
+                "value": value,
+                "weight": weight,
+                "product": value * weight,
+            }
+        )
+    return steps
 
 
 def make_valid(prefix: str) -> str:
@@ -135,6 +154,26 @@ def call_correct(number: object) -> tuple[int, object]:
             return response.status, json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+def call_explain_payload(payload: object) -> tuple[int, object]:
+    """以任意 JSON 负载调用明细入口（用于请求形状断言）。"""
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        BASE_URL + EXPLAIN_ENDPOINT,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+def call_explain(number: object) -> tuple[int, object]:
+    return call_explain_payload({"container_number": number})
 
 
 def get_health() -> tuple[int, object]:
@@ -404,6 +443,135 @@ def run() -> int:
     status, body = call_api(["CSQU3054383"])
     checks.expect("17d 旧接口合法批仍 200", status, 200)
     checks.expect("17e 旧接口通过标志", body["results"][0]["passed"], True)
+
+    # 18. 单箱计算明细：已知样例的十项乘积逐项核对，汇总独立复算
+    status, body = call_explain("CSQU3054383")
+    checks.expect("18a 明细请求 200", status, 200)
+    checks.expect("18b status=ok", body["status"], "ok")
+    checks.expect("18c 原样回显", body["container_number"], "CSQU3054383")
+    checks.expect(
+        "18d 十项步骤与独立参考一致",
+        body["steps"],
+        reference_steps("CSQU305438"),
+    )
+    checks.expect(
+        "18e 已知样例十项乘积",
+        [s["product"] for s in body["steps"]],
+        [13, 60, 112, 256, 48, 0, 320, 512, 768, 4096],
+    )
+    checks.expect("18f 乘积合计=6185", body["weighted_sum"], 6185)
+    checks.expect(
+        "18g 合计等于十项乘积之和",
+        body["weighted_sum"],
+        sum(s["product"] for s in body["steps"]),
+    )
+    checks.expect("18h 取模结果=3", body["remainder"], 3)
+    checks.expect("18i 期望校验位=3", body["expected_check_digit"], 3)
+    checks.expect("18j 实际校验位=3", body["actual_check_digit"], 3)
+    checks.expect("18k passed=true", body["passed"], True)
+
+    # 19. 余数十折零边界：余数 10 原样呈现，期望校验位折叠为 0
+    status, body = call_explain("AAAU0000060")
+    checks.expect("19a 余数10样例 200", status, 200)
+    checks.expect("19b 加权和=3398", body["weighted_sum"], 3398)
+    checks.expect("19c 取模结果=10", body["remainder"], 10)
+    checks.expect("19d 余数10折叠为期望校验位0", body["expected_check_digit"], 0)
+    checks.expect("19e passed=true", body["passed"], True)
+    status, body = call_explain("AAAU0000065")
+    checks.expect("19f 余数10但末位错误仍 200", status, 200)
+    checks.expect(
+        "19g 期望0实际5",
+        (body["expected_check_digit"], body["actual_check_digit"]),
+        (0, 5),
+    )
+    checks.expect("19h passed=false", body["passed"], False)
+
+    # 20. 结构损坏：沿用首个损坏位置与错误代码返回 422，不尝试纠正输入
+    for label, number, code, position in [
+        ("20a 小写不归一化", "csqu3054383", "not_uppercase_letter", 1),
+        ("20b 非法类别码", "CSQX3054383", "invalid_category_identifier", 4),
+        ("20c 末位非数字", "CSQU305438A", "not_digit", 11),
+        ("20d 长度不足", "CSQU305438", "invalid_length", 11),
+        ("20e 前导空白不trim", " CSQU3054383", "invalid_length", 12),
+    ]:
+        status, body = call_explain(number)
+        checks.expect(f"{label} 422", status, 422)
+        checks.expect(f"{label} status", body["status"], "invalid_container")
+        checks.expect(f"{label} 错误码", body["error_code"], code)
+        checks.expect(f"{label} 首个损坏位置", body["position"], position)
+        checks.expect(f"{label} 原样回显", body["container_number"], number)
+        checks.check(f"{label} 不返回明细", "steps" not in body, str(body))
+
+    # 21. 明细入口请求形状：缺字段、类型错误、多余字段均 422 detail
+    status, body = call_explain_payload({})
+    checks.expect("21a 缺字段 422", status, 422)
+    checks.check("21b 缺字段 detail 形态", "detail" in body, str(body))
+    status, body = call_explain(12345678901)
+    checks.expect("21c 非字符串类型 422", status, 422)
+    checks.check("21d 类型错误 detail 形态", "detail" in body, str(body))
+    status, body = call_explain_payload(
+        {"container_number": "CSQU3054383", "normalize": True}
+    )
+    checks.expect("21e 多余字段 422", status, 422)
+    checks.check("21f 多余字段 detail 形态", "detail" in body, str(body))
+
+    # 22. 明细合计及结论始终等于原校验结果：批量校验后逐箱提交明细比对
+    numbers = [
+        "CSQU3054383",  # 通过
+        "CSQU3054384",  # 末位不符
+        "AAAU0000060",  # 余数 10 折 0
+        "AAAU0000081",  # 余数 0 但末位不符
+    ]
+    status, body = call_api(numbers)
+    checks.expect("22a 批量校验 200", status, 200)
+    for result in body["results"]:
+        number = result["container_number"]
+        estatus, ebody = call_explain(number)
+        checks.expect(f"22b {number} 明细 200", estatus, 200)
+        steps_total = sum(s["product"] for s in ebody["steps"])
+        checks.check(
+            f"22c {number} 合计=十项乘积和=批量加权和",
+            steps_total == ebody["weighted_sum"] == result["weighted_sum"],
+            f"steps={steps_total} explain={ebody['weighted_sum']} "
+            f"verify={result['weighted_sum']}",
+        )
+        checks.check(
+            f"22d {number} 期望/实际/结论与批量一致",
+            (
+                ebody["expected_check_digit"],
+                ebody["actual_check_digit"],
+                ebody["passed"],
+            )
+            == (
+                result["expected_check_digit"],
+                result["actual_check_digit"],
+                result["passed"],
+            ),
+            f"explain=({ebody['expected_check_digit']}, "
+            f"{ebody['actual_check_digit']}, {ebody['passed']}) "
+            f"verify=({result['expected_check_digit']}, "
+            f"{result['actual_check_digit']}, {result['passed']})",
+        )
+        checks.expect(
+            f"22e {number} 取模结果", ebody["remainder"], result["weighted_sum"] % 11
+        )
+
+    # 23. 旧接口回归：明细入口引入后批量校验与单箱纠错行为不变
+    status, body = call_api(["CSQU3054383", "CSQU3054384"])
+    checks.expect("23a 批量校验仍 200", status, 200)
+    checks.expect(
+        "23b 逐项通过标志不变",
+        [r["passed"] for r in body["results"]],
+        [True, False],
+    )
+    status, body = call_correct("CSQU3054384")
+    checks.expect("23c 纠错入口仍 200", status, 200)
+    checks.expect("23d 纠错状态仍 multiple", body["status"], "multiple")
+    checks.expect(
+        "23e 纠错候选与独立枚举一致",
+        body["candidates"],
+        reference_corrections("CSQU3054384"),
+    )
 
     return _report(checks)
 

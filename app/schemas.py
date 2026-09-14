@@ -129,3 +129,70 @@ class CorrectResponse(BaseModel):
     candidates: list[CorrectionCandidateOut] = Field(
         ..., description="按（差异位置, 替换字符）稳定排序的候选列表"
     )
+
+
+class ExplainRequest(BaseModel):
+    """单箱计算明细请求：一个箱号，原样使用，不做任何归一化。
+
+    不限制字符串长度：长度等结构问题由业务层按首个损坏位置拒绝，
+    与批量校验的结构错误口径一致；此处只保证字段形状正确。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    container_number: str = Field(
+        ...,
+        description=(
+            "待复算明细的箱号。字符串原样使用，"
+            "不进行大小写或空白归一化。"
+        ),
+    )
+
+
+class ChecksumStepOut(BaseModel):
+    """前 10 位中单个字符的加权计算步骤。"""
+
+    position: int = Field(..., description="字符在箱号中的位置（从 1 起）")
+    character: str = Field(..., description="该位置的原样字符")
+    value: int = Field(
+        ..., description="字符映射值（数字取原值，字母按跳号表取值）"
+    )
+    weight: int = Field(..., description="二次幂权重 2**(position-1)")
+    product: int = Field(..., description="映射值与权重的乘积")
+
+
+class ExplainResponse(BaseModel):
+    """单箱逐字符计算明细与汇总结论（汇总由步骤求和派生）。"""
+
+    status: Literal["ok"] = "ok"
+    container_number: str = Field(..., description="原样回显的输入箱号")
+    steps: list[ChecksumStepOut] = Field(
+        ..., description="前 10 位按原位置顺序的计算步骤（恰 10 项）"
+    )
+    weighted_sum: int = Field(..., description="十项乘积的合计")
+    remainder: int = Field(
+        ..., description="合计对 11 取余的原始余数（0..10，未折叠）"
+    )
+    expected_check_digit: int = Field(
+        ..., description="期望校验位（余数 10 折叠为 0）"
+    )
+    actual_check_digit: int = Field(..., description="箱号末位携带的实际校验位")
+    passed: bool = Field(
+        ..., description="期望校验位与实际校验位是否一致"
+    )
+
+
+class InvalidContainerResponse(BaseModel):
+    """单箱结构非法：指出首个损坏位置（与批量结构错误同一来源）。"""
+
+    status: Literal["invalid_container"] = "invalid_container"
+    container_number: str = Field(..., description="原样回显的输入箱号")
+    error_code: str
+    position: int = Field(
+        ...,
+        description=(
+            f"箱号内首个损坏字符的位置（从 1 起，共 {CONTAINER_LENGTH} 位）；"
+            "长度错误时为越界位置"
+        ),
+    )
+    message: str
