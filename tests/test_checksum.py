@@ -16,6 +16,7 @@ import pytest
 from app.checksum import (
     CONTAINER_LENGTH,
     LETTER_VALUES,
+    OwnerSummary,
     character_value,
     checksum_steps,
     correction_candidates,
@@ -24,6 +25,7 @@ from app.checksum import (
     letter_value,
     split_container_number,
     structure_error,
+    summarize_by_owner,
     weighted_sum,
 )
 
@@ -206,6 +208,66 @@ def test_split_container_number_fields() -> None:
     assert parts.category_identifier == "U"
     assert parts.serial_number == "305438"
     assert parts.check_digit == "3"
+
+
+# ---------------------------------------------------------------- 箱主汇总
+
+
+def test_summarize_by_owner_interleaved_first_seen_order() -> None:
+    # 交错输入：返回顺序按箱主首次出现，而非字母序或分组实现细节。
+    verdicts = [
+        ("CSQ", True),
+        ("AAA", False),
+        ("CSQ", False),
+        ("MSC", True),
+        ("AAA", True),
+        ("CSQ", True),
+    ]
+    summary = summarize_by_owner(verdicts)
+    assert [group.owner_code for group in summary] == ["CSQ", "AAA", "MSC"]
+    assert [(g.total, g.passed, g.failed) for g in summary] == [
+        (3, 2, 1),
+        (2, 1, 1),
+        (1, 1, 0),
+    ]
+
+
+def test_summarize_by_owner_duplicate_owner_forms_single_entry() -> None:
+    summary = summarize_by_owner([("CSQ", True), ("CSQ", False), ("CSQ", True)])
+    assert summary == (
+        OwnerSummary(owner_code="CSQ", total=3, passed=2, failed=1),
+    )
+
+
+def test_summarize_by_owner_counts_match_independent_rescan() -> None:
+    # 测试侧用逐箱主整批重扫的独立归组，复核单次遍历的计数结果。
+    verdicts = [("AAA", True), ("CSQ", False), ("AAA", False), ("CSQ", True)]
+    summary = summarize_by_owner(verdicts)
+    owners = list(dict.fromkeys(owner for owner, _ in verdicts))
+    expected = [
+        (
+            owner,
+            sum(1 for o, _ in verdicts if o == owner),
+            sum(1 for o, p in verdicts if o == owner and p),
+            sum(1 for o, p in verdicts if o == owner and not p),
+        )
+        for owner in owners
+    ]
+    assert [(g.owner_code, g.total, g.passed, g.failed) for g in summary] == expected
+    # 每组恒有 passed + failed == total，各组之和恒等于输入条数。
+    for group in summary:
+        assert group.passed + group.failed == group.total
+    assert sum(g.total for g in summary) == len(verdicts)
+
+
+def test_summarize_by_owner_empty_input() -> None:
+    assert summarize_by_owner([]) == ()
+
+
+def test_owner_summary_is_immutable() -> None:
+    group = summarize_by_owner([("CSQ", True)])[0]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        group.total = 0  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------- 纠错候选

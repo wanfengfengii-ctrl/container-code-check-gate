@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 CONTAINER_LENGTH = 11
@@ -232,6 +233,49 @@ def split_container_number(container_number: str) -> ContainerParts:
         category_identifier=container_number[3],
         serial_number=container_number[4:10],
         check_digit=container_number[10],
+    )
+
+
+@dataclass(frozen=True)
+class OwnerSummary:
+    """单个箱主的班组统计（不可变）。
+
+    ``total`` 为该箱主在本批中的箱数，``passed`` / ``failed`` 为其中
+    校验通过与未通过的数量；恒有 ``passed + failed == total``。
+    """
+
+    owner_code: str
+    total: int
+    passed: int
+    failed: int
+
+
+def summarize_by_owner(
+    verdicts: Iterable[tuple[str, bool]],
+) -> tuple[OwnerSummary, ...]:
+    """把逐箱（箱主代码, 是否通过）结论按箱主聚合成班组统计。
+
+    输入来自已完成的逐箱校验结论，本函数只负责计数，不重新拆分箱号、
+    不复算校验位。按箱主**首次出现顺序**返回，重复箱主只形成一项；
+    每项给出总数、通过数与未通过数。
+    """
+    totals: dict[str, int] = {}
+    passes: dict[str, int] = {}
+    for owner_code, passed in verdicts:
+        if owner_code not in totals:
+            totals[owner_code] = 0
+            passes[owner_code] = 0
+        totals[owner_code] += 1
+        passes[owner_code] += int(passed)
+    # dict 依插入顺序迭代，即箱主首次出现顺序。
+    return tuple(
+        OwnerSummary(
+            owner_code=owner_code,
+            total=total,
+            passed=passes[owner_code],
+            failed=total - passes[owner_code],
+        )
+        for owner_code, total in totals.items()
     )
 
 

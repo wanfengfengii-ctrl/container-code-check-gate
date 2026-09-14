@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
 from app.checksum import CONTAINER_LENGTH
 
@@ -25,6 +25,16 @@ class VerifyRequest(BaseModel):
         description=(
             "待校验箱号列表（含端点 1 至 100 个）。字符串原样使用，"
             "不进行大小写或空白归一化。"
+        ),
+    )
+    # 严格布尔：只接受 JSON true/false；"true"、1 等类型错误的值一律
+    # 进入 Pydantic 请求校验 422（detail 数组），不做宽松转换。
+    include_owner_summary: StrictBool = Field(
+        default=False,
+        description=(
+            "可选箱主汇总开关。为 true 时响应附带 owner_summary：按箱主"
+            "首次出现顺序给出每组总数、通过数与未通过数；省略或为 false "
+            "时响应与不携带该开关的旧版请求逐字段一致。"
         ),
     )
 
@@ -58,6 +68,15 @@ class ContainerResult(BaseModel):
     )
 
 
+class OwnerSummaryOut(BaseModel):
+    """单个箱主的班组统计。"""
+
+    owner_code: str = Field(..., description="箱主代码（前 3 位大写字母）")
+    total: int = Field(..., description="该箱主在本批中的箱数")
+    passed: int = Field(..., description="该箱主校验通过的箱数")
+    failed: int = Field(..., description="该箱主校验未通过的箱数")
+
+
 class VerifyResponse(BaseModel):
     """结构全部合法时的逐项可复算结果。"""
 
@@ -66,6 +85,15 @@ class VerifyResponse(BaseModel):
     passed_count: int
     failed_count: int
     results: list[ContainerResult]
+    # 仅当请求开启箱主汇总开关时赋值；为 None 时由路由的
+    # response_model_exclude_none 剔除，旧客户端看不到该字段。
+    owner_summary: list[OwnerSummaryOut] | None = Field(
+        default=None,
+        description=(
+            "按箱主首次出现顺序的班组统计（重复箱主只一项）；"
+            "仅当请求开启 include_owner_summary 时携带。"
+        ),
+    )
 
 
 class InvalidBatchResponse(BaseModel):

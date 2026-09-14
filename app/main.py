@@ -25,6 +25,7 @@ from app.checksum import (
     explain_check_digit,
     split_container_number,
     structure_error,
+    summarize_by_owner,
     weighted_sum,
 )
 from app.schemas import (
@@ -38,6 +39,7 @@ from app.schemas import (
     ExplainResponse,
     InvalidBatchResponse,
     InvalidContainerResponse,
+    OwnerSummaryOut,
     VerifyRequest,
     VerifyResponse,
 )
@@ -101,6 +103,9 @@ def health() -> dict[str, str]:
 @app.post(
     "/api/v1/container-numbers/verify",
     response_model=VerifyResponse,
+    # owner_summary 未开启时为 None，序列化时剔除该字段，使省略开关的
+    # 旧请求得到的响应与引入开关前逐字段一致。
+    response_model_exclude_none=True,
     summary="批量复算箱号校验位",
     responses={
         422: {
@@ -157,11 +162,28 @@ def verify_container_numbers(request: VerifyRequest) -> VerifyResponse | JSONRes
             )
         )
 
+    # 可选的箱主汇总：复用上面每项已算出的箱主代码与通过结论，
+    # 由领域层一次聚合成班组统计；路由不做任何计数。
+    owner_summary: list[OwnerSummaryOut] | None = None
+    if request.include_owner_summary:
+        owner_summary = [
+            OwnerSummaryOut(
+                owner_code=group.owner_code,
+                total=group.total,
+                passed=group.passed,
+                failed=group.failed,
+            )
+            for group in summarize_by_owner(
+                (result.parts.owner_code, result.passed) for result in results
+            )
+        ]
+
     return VerifyResponse(
         count=len(container_numbers),
         passed_count=passed_count,
         failed_count=len(container_numbers) - passed_count,
         results=results,
+        owner_summary=owner_summary,
     )
 
 

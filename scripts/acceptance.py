@@ -126,8 +126,9 @@ def hamming_distance(a: str, b: str) -> int:
 # ----------------------------------------------------------------- HTTP
 
 
-def call_api(numbers: list[str]) -> tuple[int, object]:
-    data = json.dumps({"container_numbers": numbers}).encode("utf-8")
+def call_verify_payload(payload: object) -> tuple[int, object]:
+    """以任意 JSON 负载调用批量校验入口（用于开关与形状断言）。"""
+    data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         BASE_URL + ENDPOINT,
         data=data,
@@ -139,6 +140,10 @@ def call_api(numbers: list[str]) -> tuple[int, object]:
             return response.status, json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+def call_api(numbers: list[str]) -> tuple[int, object]:
+    return call_verify_payload({"container_numbers": numbers})
 
 
 def call_correct(number: object) -> tuple[int, object]:
@@ -621,6 +626,105 @@ def run() -> int:
     status, body = call_correct(surrogate_number + "X")  # 12 位，超长
     checks.expect("25a 超长代理字符输入 422", status, 422)
     checks.check("25b 请求形状错误 detail 形态", "detail" in body, str(body))
+
+    # 26. 箱主汇总开关：交错箱主批次一次调用同时取得逐箱结论与班组统计，
+    # 独立计数复核各组之和等于原批次总数且失败数一致。
+    numbers = [
+        "CSQU3054383",  # CSQ 通过
+        "AAAU0000060",  # AAA 通过
+        "CSQU3054384",  # CSQ 未通过
+        "MSCU6355890",  # MSC（结论由独立复算判定）
+        "AAAU0000081",  # AAA 未通过
+        "CSQU3054383",  # CSQ 通过（重复箱号）
+    ]
+    status, body = call_verify_payload(
+        {"container_numbers": numbers, "include_owner_summary": True}
+    )
+    checks.expect("26a 开启开关的批次 200", status, 200)
+    checks.expect(
+        "26b 逐箱结论与独立复算一致",
+        [r["passed"] for r in body["results"]],
+        [reference_check_digit(n[:10])[1] == int(n[10]) for n in numbers],
+    )
+    summary = body["owner_summary"]
+    checks.expect(
+        "26c 按箱主首次出现顺序",
+        [g["owner_code"] for g in summary],
+        ["CSQ", "AAA", "MSC"],
+    )
+    # 独立归组参考：先取首次出现顺序，再逐箱主整批重扫计数。
+    owners = list(dict.fromkeys(n[:3] for n in numbers))
+    expected_summary = [
+        {
+            "owner_code": owner,
+            "total": sum(1 for n in numbers if n[:3] == owner),
+            "passed": sum(
+                1
+                for n in numbers
+                if n[:3] == owner
+                and reference_check_digit(n[:10])[1] == int(n[10])
+            ),
+            "failed": sum(
+                1
+                for n in numbers
+                if n[:3] == owner
+                and reference_check_digit(n[:10])[1] != int(n[10])
+            ),
+        }
+        for owner in owners
+    ]
+    checks.expect("26d 各组计数与独立归组一致", summary, expected_summary)
+    checks.expect(
+        "26e 各组总数之和等于原批次总数",
+        sum(g["total"] for g in summary),
+        len(numbers),
+    )
+    checks.expect(
+        "26f 各组失败数之和等于整批失败数",
+        sum(g["failed"] for g in summary),
+        body["failed_count"],
+    )
+    checks.expect(
+        "26g 各组通过数之和等于整批通过数",
+        sum(g["passed"] for g in summary),
+        body["passed_count"],
+    )
+    checks.expect("26h 重复箱主只形成一项", len(summary), 3)
+
+    # 27. 开关省略或为假：响应与旧版逐字段一致，原有客户端无需处理新字段
+    status, body = call_api(["CSQU3054383", "CSQU3054384"])
+    checks.expect("27a 省略开关的批次 200", status, 200)
+    checks.check(
+        "27b 省略开关无 owner_summary 字段",
+        "owner_summary" not in body,
+        str(body),
+    )
+    status, body_off = call_verify_payload(
+        {
+            "container_numbers": ["CSQU3054383", "CSQU3054384"],
+            "include_owner_summary": False,
+        }
+    )
+    checks.expect("27c 开关为假仍 200", status, 200)
+    checks.expect("27d 开关为假与省略时逐字段一致", body_off, body)
+
+    # 28. 开关开启时结构非法批仍整批拒绝且不产生汇总；开关类型错误走 detail
+    status, body = call_verify_payload(
+        {
+            "container_numbers": ["CSQU3054383", "csqu3054383"],
+            "include_owner_summary": True,
+        }
+    )
+    checks.expect("28a 开关开启的非法批仍 422", status, 422)
+    checks.expect("28b status=invalid_batch", body["status"], "invalid_batch")
+    checks.expect("28c 最小非法索引=1", body["index"], 1)
+    checks.check("28d 不产生汇总", "owner_summary" not in body, str(body))
+    checks.check("28e 不返回逐项结果", "results" not in body, str(body))
+    status, body = call_verify_payload(
+        {"container_numbers": ["CSQU3054383"], "include_owner_summary": "yes"}
+    )
+    checks.expect("28f 开关类型错误 422", status, 422)
+    checks.check("28g 开关类型错误 detail 形态", "detail" in body, str(body))
 
     return _report(checks)
 

@@ -224,6 +224,144 @@ def test_mixed_batch_preserves_original_indices_and_counts() -> None:
     assert last["actual_check_digit"] == 1
 
 
+# -------------------------------------------------------------- 箱主汇总开关
+
+
+def _reference_owner_summary(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """测试侧独立归组：先取箱主首次出现顺序，再逐箱主整批重扫计数，
+    与服务端单次遍历的分组实现刻意不同。"""
+    owners = list(dict.fromkeys(r["parts"]["owner_code"] for r in results))
+    return [
+        {
+            "owner_code": owner,
+            "total": sum(1 for r in results if r["parts"]["owner_code"] == owner),
+            "passed": sum(
+                1
+                for r in results
+                if r["parts"]["owner_code"] == owner and r["passed"]
+            ),
+            "failed": sum(
+                1
+                for r in results
+                if r["parts"]["owner_code"] == owner and not r["passed"]
+            ),
+        }
+        for owner in owners
+    ]
+
+
+# 交错箱主批次：同一箱主多次出现且不相邻，校验结论通过/未通过混杂。
+INTERLEAVED_NUMBERS = [
+    "CSQU3054383",  # CSQ 通过
+    "AAAU0000060",  # AAA 通过
+    "CSQU3054384",  # CSQ 未通过
+    "MSCU6355890",  # MSC（结论由独立复算判定）
+    "AAAU0000081",  # AAA 未通过
+    "CSQU3054383",  # CSQ 通过（重复箱号）
+]
+
+
+def test_owner_summary_interleaved_order_and_counts() -> None:
+    response = client.post(
+        VALID_ENDPOINT,
+        json={
+            "container_numbers": INTERLEAVED_NUMBERS,
+            "include_owner_summary": True,
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    # 一次调用同时取得逐箱结论与班组统计。
+    assert [r["index"] for r in body["results"]] == list(range(6))
+    summary = body["owner_summary"]
+    # 首次出现顺序钉死为 CSQ -> AAA -> MSC，重复箱主只形成一项。
+    assert [g["owner_code"] for g in summary] == ["CSQ", "AAA", "MSC"]
+    assert len(summary) == 3
+    # 计数与测试侧独立归组（整批重扫）一致，不受分组实现影响。
+    assert summary == _reference_owner_summary(body["results"])
+    # 各组之和恒等于整批计数。
+    assert sum(g["total"] for g in summary) == body["count"] == 6
+    assert sum(g["passed"] for g in summary) == body["passed_count"]
+    assert sum(g["failed"] for g in summary) == body["failed_count"]
+    for group in summary:
+        assert group["passed"] + group["failed"] == group["total"]
+
+
+def test_owner_summary_single_owner_batch_forms_one_entry() -> None:
+    response = client.post(
+        VALID_ENDPOINT,
+        json={
+            "container_numbers": ["CSQU3054383", "CSQU3054384"],
+            "include_owner_summary": True,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["owner_summary"] == [
+        {"owner_code": "CSQ", "total": 2, "passed": 1, "failed": 1}
+    ]
+
+
+# 旧请求快照：引入开关前的请求与响应形态，逐字段锁定兼容行为。
+LEGACY_SNAPSHOT_REQUEST = {"container_numbers": ["CSQU3054383", "CSQU3054384"]}
+LEGACY_SNAPSHOT_RESPONSE = {
+    "status": "ok",
+    "count": 2,
+    "passed_count": 1,
+    "failed_count": 1,
+    "results": [
+        {
+            "index": 0,
+            "container_number": "CSQU3054383",
+            "parts": {
+                "owner_code": "CSQ",
+                "category_identifier": "U",
+                "serial_number": "305438",
+                "check_digit": "3",
+            },
+            "weighted_sum": 6185,
+            "expected_check_digit": 3,
+            "actual_check_digit": 3,
+            "passed": True,
+        },
+        {
+            "index": 1,
+            "container_number": "CSQU3054384",
+            "parts": {
+                "owner_code": "CSQ",
+                "category_identifier": "U",
+                "serial_number": "305438",
+                "check_digit": "4",
+            },
+            "weighted_sum": 6185,
+            "expected_check_digit": 3,
+            "actual_check_digit": 4,
+            "passed": False,
+        },
+    ],
+}
+
+
+def test_verify_without_switch_matches_legacy_snapshot() -> None:
+    # 省略开关：响应与旧快照逐字段一致，原有客户端无需处理新字段。
+    response = client.post(VALID_ENDPOINT, json=LEGACY_SNAPSHOT_REQUEST)
+    assert response.status_code == 200
+    body = response.json()
+    assert body == LEGACY_SNAPSHOT_RESPONSE
+    assert "owner_summary" not in body
+
+
+def test_verify_switch_false_identical_to_omitted() -> None:
+    # 开关为假：与省略开关的响应逐字段一致。
+    omitted = client.post(VALID_ENDPOINT, json=LEGACY_SNAPSHOT_REQUEST)
+    switched_off = client.post(
+        VALID_ENDPOINT,
+        json={**LEGACY_SNAPSHOT_REQUEST, "include_owner_summary": False},
+    )
+    assert switched_off.status_code == 200
+    assert switched_off.json() == omitted.json() == LEGACY_SNAPSHOT_RESPONSE
+    assert "owner_summary" not in switched_off.json()
+
+
 # ------------------------------------------------------------- 整批结构拒绝
 
 
@@ -288,6 +426,27 @@ def test_no_partial_results_when_batch_unparseable() -> None:
     assert "results" not in response.json()
 
 
+def test_invalid_batch_with_switch_still_rejected_without_summary() -> None:
+    # 开关开启不改变整批拒绝语义：仍按最小输入索引返回 422 业务错误，
+    # 且不产生任何汇总。
+    response = client.post(
+        VALID_ENDPOINT,
+        json={
+            "container_numbers": ["CSQU3054383", "csqu3054383"],
+            "include_owner_summary": True,
+        },
+    )
+    assert response.status_code == 422
+    body = response.json()
+    assert body["status"] == "invalid_batch"
+    assert body["count"] == 2
+    assert body["index"] == 1
+    assert body["error_code"] == "not_uppercase_letter"
+    assert body["position"] == 1
+    assert "results" not in body
+    assert "owner_summary" not in body
+
+
 # -------------------------------------------------------------- 请求形状校验
 
 
@@ -337,6 +496,23 @@ def test_missing_field_wrong_type_and_extra_field_rejected() -> None:
         "normalize": True,
     }
     assert client.post(VALID_ENDPOINT, json=extra).status_code == 422
+
+
+def test_owner_summary_switch_wrong_type_is_request_validation_error() -> None:
+    # 开关只接受 JSON true/false；字符串、数字等类型错误的值一律进入
+    # Pydantic 的 422 detail，而非业务负载，也不做宽松转换。
+    for bad_value in ("yes", "true", 1, 0):
+        response = client.post(
+            VALID_ENDPOINT,
+            json={
+                "container_numbers": ["CSQU3054383"],
+                "include_owner_summary": bad_value,
+            },
+        )
+        assert response.status_code == 422, bad_value
+        body = response.json()
+        assert "detail" in body
+        assert body.get("status") != "invalid_batch"
 
 
 def test_echo_does_not_mutate_input() -> None:

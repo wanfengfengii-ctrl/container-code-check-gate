@@ -2,9 +2,11 @@
 
 纯后端服务：批量复算集装箱箱号的 ISO 6346 风格校验位，让闸口在放行前
 得到**可复算**的结论。手抄箱号错一位时，末位校验码对不上，服务会逐箱
-标出期望校验位、实际校验位与加权和；对未通过的箱号，还可提交单箱纠错
-入口，枚举“只差一个字符”的合法候选号；对校验结论有争议时，可提交单箱
-计算明细入口，逐字符还原映射值、权重与乘积的完整计算过程供现场复核。
+标出期望校验位、实际校验位与加权和；批量校验还可按开关附带**箱主汇总**，
+按箱主首次出现顺序给出每组总数、通过数与未通过数，供班组分配人工复核
+量；对未通过的箱号，还可提交单箱纠错入口，枚举"只差一个字符"的合法
+候选号；对校验结论有争议时，可提交单箱计算明细入口，逐字符还原映射值、
+权重与乘积的完整计算过程供现场复核。
 
 - 运行时：Python 3.12、FastAPI、Pydantic v2、Uvicorn
 - 无数据库、无外部依赖；字符映射与加权计算逻辑见 `app/checksum.py`
@@ -115,6 +117,39 @@ curl -s -X POST http://localhost:8000/api/v1/container-numbers/verify \
 `weighted_sum` 与 `expected_check_digit` 可由调用方用上文规则原样复算。
 余数 10 折叠为 0 的边界样例：`AAAU000006` 加权和 `3398`，余 10，故合法
 箱号为 `AAAU0000060`。
+
+### 可选箱主汇总（`include_owner_summary`）
+
+请求体可携带可选开关 `"include_owner_summary": true`（只接受 JSON
+`true`/`false`，其他类型按请求校验返回 422 `detail`）。开关开启且整批
+结构合法时，响应在逐箱结论之外附带 `owner_summary`：服务复用每项已算出
+的箱主代码与通过结论，按**箱主首次出现顺序**给出每组总数、通过数与
+未通过数，重复箱主只形成一项，供班组按箱主分配人工复核量：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/container-numbers/verify \
+  -H 'Content-Type: application/json' \
+  -d '{"container_numbers": ["CSQU3054383", "AAAU0000060", "CSQU3054384"],
+       "include_owner_summary": true}'
+```
+
+```json
+{
+  "status": "ok",
+  "count": 3,
+  "passed_count": 2,
+  "failed_count": 1,
+  "results": [ "……逐项结论同上……" ],
+  "owner_summary": [
+    {"owner_code": "CSQ", "total": 2, "passed": 1, "failed": 1},
+    {"owner_code": "AAA", "total": 1, "passed": 1, "failed": 0}
+  ]
+}
+```
+
+开关**省略或为 `false`** 时，响应与不携带该开关的旧版请求**逐字段一致**
+（不出现 `owner_summary` 字段），原有客户端无需处理新字段。批内出现
+结构非法项时仍按最小输入索引返回 422 业务错误，且不产生汇总。
 
 ### 情形二：批次无法解析（HTTP 422, `status=invalid_batch`）——整批拒绝
 
@@ -296,7 +331,9 @@ curl -s -X POST http://localhost:8000/api/v1/container-numbers/explain \
 结构首损定位、批量边界与两类 422 的区分均有覆盖；纠错入口以独立汉明
 距离枚举断言唯一候选、歧义候选、无候选及旧接口回归；明细入口以独立
 参考实现断言已知样例的十项乘积、余数十折零边界、结构错误定位，并逐箱
-确认明细合计与结论始终等于批量校验结果：
+确认明细合计与结论始终等于批量校验结果；箱主汇总以交错输入断言首次
+出现顺序与计数（测试侧整批重扫独立归组），并以旧请求快照锁定开关省略
+或为假时的逐字段兼容：
 
 ```bash
 .venv/bin/pip install -r requirements-dev.txt
@@ -327,12 +364,12 @@ docker compose --profile acceptance up --build \
 
 ```
 app/
-  checksum.py     # 字符映射、加权和、期望校验位、结构判定、纠错候选、计算明细（独立可测）
+  checksum.py     # 字符映射、加权和、期望校验位、结构判定、纠错候选、计算明细、箱主汇总（独立可测）
   schemas.py      # Pydantic 请求/响应模型
-  main.py         # FastAPI 路由：整批结构校验 + 逐项复算 + 单箱纠错 + 单箱明细
+  main.py         # FastAPI 路由：整批结构校验 + 逐项复算 + 可选箱主汇总 + 单箱纠错 + 单箱明细
 tests/
   test_checksum.py  # 映射跳号与余数边界等单元测试
-  test_api.py       # API 端到端测试（含纠错、明细入口的独立参考断言）
+  test_api.py       # API 端到端测试（含纠错、明细、箱主汇总的独立参考断言）
 scripts/
   acceptance.py     # verify 一次性验收脚本（仅用标准库）
 docker-compose.yml  # 仅 api 常驻；verify 为一次性任务
