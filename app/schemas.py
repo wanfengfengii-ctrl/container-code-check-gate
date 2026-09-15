@@ -6,10 +6,15 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
-from app.checksum import CONTAINER_LENGTH
+from app.checksum import CONSENSUS_SOLUTION_LIMIT, CONTAINER_LENGTH
 
 MIN_BATCH = 1
 MAX_BATCH = 100
+
+# 共识读数条数上下限（含端点）：同一箱体至少两份读数才有共识意义，
+# 上限沿用批量规模。
+MIN_READINGS = 2
+MAX_READINGS = 100
 
 
 class VerifyRequest(BaseModel):
@@ -376,4 +381,80 @@ class ReconcileInvalidItemResponse(BaseModel):
     )
     passed: Literal[False] = Field(
         ..., description="原校验结论：无效项恒为 false"
+    )
+
+
+# ------------------------------------------------------------- 闸口多读数共识
+
+
+class ConsensusRequest(BaseModel):
+    """闸口共识请求：同一箱体的 2..100 条原始读数，原样传递，不做任何归一化。
+
+    每条读数必须恰为 11 个字符：与单箱纠错同理，不用带长度约束的字符串
+    类型，以免含未配对代理字符的读数在请求校验阶段被误判为形状错误；
+    逐条长度检查由下方的 Python 校验器完成，错误形态仍是请求校验 422
+    （detail 数组）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    readings: list[str] = Field(
+        ...,
+        min_length=MIN_READINGS,
+        max_length=MAX_READINGS,
+        description=(
+            "同一箱体的原始读数列表（含端点 2 至 100 条）。每条恰为 "
+            f"{CONTAINER_LENGTH} 个字符，原样使用，不进行大小写或空白"
+            "归一化；重复读数重复计票。"
+        ),
+    )
+
+    @field_validator("readings")
+    @classmethod
+    def _each_reading_exactly_eleven(cls, value: list[str]) -> list[str]:
+        for reading in value:
+            if len(reading) != CONTAINER_LENGTH:
+                raise ValueError(
+                    f"each reading must be exactly {CONTAINER_LENGTH} "
+                    f"characters, got {len(reading)}"
+                )
+        return value
+
+
+class ConsensusResponse(BaseModel):
+    """一批原始读数的共识结论：唯一确定为 determined，多解并列为
+    ambiguous，无解为 no_solution（此时最小代价为 null）。"""
+
+    status: Literal["determined", "ambiguous", "no_solution"] = Field(
+        ...,
+        description=(
+            "determined=唯一最优解；ambiguous=多个最优解并列；"
+            "no_solution=无解（任一位置无合法观测，或候选域中不存在"
+            "满足校验位的组合）"
+        ),
+    )
+    reading_count: int = Field(
+        ..., description="参与计票的原始读数条数（重复读数重复计票）"
+    )
+    minimum_cost: int | None = Field(
+        ...,
+        description="最优解对全部读数的逐位不一致总数；无解时为 null",
+    )
+    optimal_count: int = Field(
+        ...,
+        description="达到最小代价的合法箱号总数（精确计数；无解时为 0）",
+    )
+    solutions: list[str] = Field(
+        ...,
+        description=(
+            f"按完整箱号字典序排列的前 {CONSENSUS_SOLUTION_LIMIT} 个最优解"
+            "（无解时为空）"
+        ),
+    )
+    truncated: bool = Field(
+        ...,
+        description=(
+            f"最优解总数超过 {CONSENSUS_SOLUTION_LIMIT} 时为 true，"
+            "solutions 仅含字典序前 100 个"
+        ),
     )

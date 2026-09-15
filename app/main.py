@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 
 from app.checksum import (
     ReconcileInvalidItem,
+    consensus_container_number,
     correction_candidates,
     expected_check_digit,
     explain_check_digit,
@@ -32,6 +33,8 @@ from app.checksum import (
 )
 from app.schemas import (
     ChecksumStepOut,
+    ConsensusRequest,
+    ConsensusResponse,
     ContainerPartsOut,
     ContainerResult,
     CorrectRequest,
@@ -346,4 +349,30 @@ def reconcile_container_lists(
             )
             for item in outcome.extra
         ],
+    )
+
+
+@app.post(
+    "/api/v1/container-numbers/consensus",
+    response_model=ConsensusResponse,
+    summary="闸口多读数共识：雨污遮挡下对同一箱体的矛盾读数求最可信合法箱号",
+)
+def consensus_container_numbers(request: ConsensusRequest) -> ConsensusResponse:
+    # 请求形状（2..100 条读数、每条恰 11 位、字段齐全、无多余字段）由
+    # Pydantic 把关；路由只编排领域求解与字段映射，结论形态由最优解
+    # 数量派生：0 无解、1 确定、多 歧义。
+    result = consensus_container_number(request.readings)
+    if result.optimal_count == 0:
+        status: Literal["determined", "ambiguous", "no_solution"] = "no_solution"
+    elif result.optimal_count == 1:
+        status = "determined"
+    else:
+        status = "ambiguous"
+    return ConsensusResponse(
+        status=status,
+        reading_count=result.reading_count,
+        minimum_cost=result.minimum_cost,
+        optimal_count=result.optimal_count,
+        solutions=list(result.solutions),
+        truncated=result.truncated,
     )

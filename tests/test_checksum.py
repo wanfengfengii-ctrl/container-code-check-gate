@@ -9,20 +9,25 @@
 from __future__ import annotations
 
 import dataclasses
+import itertools
+import random
 import string
 
 import pytest
 
 from app.checksum import (
+    CONSENSUS_SOLUTION_LIMIT,
     CONTAINER_LENGTH,
-    LETTER_VALUES,
     EXPECTED_LIST,
+    LETTER_VALUES,
     ONSITE_LIST,
+    ConsensusResult,
     OwnerSummary,
     ReconcileInvalidItem,
     ReconcileResult,
     character_value,
     checksum_steps,
+    consensus_container_number,
     correction_candidates,
     expected_check_digit,
     explain_check_digit,
@@ -787,3 +792,204 @@ def test_reconcile_empty_valid_lists_when_called_directly() -> None:
         0,
     )
     assert result.matched == result.missing == result.extra == ()
+
+
+# ---------------------------------------------------------------- 多读数共识
+
+# 经独立参考实现确认合法的箱号：CSQU3054383（余 3）、CSQU3054399（余 9）。
+CONS_A = "CSQU3054383"
+CONS_B = "CSQU3054399"
+
+
+def _reference_consensus(readings: list[str]) -> tuple[int, int, list[str]] | None:
+    """测试侧独立参考实现：候选域笛卡尔积暴力枚举，逐组合复算校验位与
+    逐位不一致总数，与服务端的反向动态规划实现刻意不同。
+
+    返回 (最小代价, 最优解总数, 字典序解列表)；无解时返回 None。
+    """
+    domains = (
+        [set(string.ascii_uppercase)] * 3
+        + [set("UJZ")]
+        + [set(string.digits)] * 7
+    )
+    candidates: list[list[str]] = []
+    for position in range(CONTAINER_LENGTH):
+        observed = {reading[position] for reading in readings}
+        candidates.append(sorted(observed & domains[position]))
+    best_cost: int | None = None
+    solutions: list[str] = []
+    for combo in itertools.product(*candidates):
+        remainder = _reference_weighted_sum("".join(combo[:10])) % MODULUS
+        if (0 if remainder == 10 else remainder) != int(combo[10]):
+            continue
+        cost = sum(
+            reading[position] != combo[position]
+            for reading in readings
+            for position in range(CONTAINER_LENGTH)
+        )
+        if best_cost is None or cost < best_cost:
+            best_cost = cost
+            solutions = ["".join(combo)]
+        elif cost == best_cost:
+            solutions.append("".join(combo))
+    if best_cost is None:
+        return None
+    return best_cost, len(solutions), sorted(solutions)
+
+
+# 与 test_api.py 同形的独立加权和参考（本文件顶部已有字母表参考实现）。
+MODULUS = 11
+
+
+def _reference_weighted_sum(first_ten: str) -> int:
+    values = _reference_letter_values()
+    return sum(
+        (int(char) if char.isdigit() else values[char]) * 2**position
+        for position, char in enumerate(first_ten)
+    )
+
+
+def _assert_matches_reference(readings: list[str], result: ConsensusResult) -> None:
+    """共识结果与独立暴力枚举逐字段一致（全局最优、精确计数、字典序）。"""
+    reference = _reference_consensus(readings)
+    assert result.reading_count == len(readings)
+    if reference is None:
+        assert result.minimum_cost is None
+        assert result.optimal_count == 0
+        assert result.solutions == ()
+        assert result.truncated is False
+        return
+    cost, count, numbers = reference
+    assert result.minimum_cost == cost
+    assert result.optimal_count == count
+    assert result.solutions == tuple(numbers[:CONSENSUS_SOLUTION_LIMIT])
+    assert result.truncated is (count > CONSENSUS_SOLUTION_LIMIT)
+    # 每个返回解自身结构合法、校验位通过，且代价确为最小代价。
+    for number in result.solutions:
+        assert structure_error(number) is None
+        assert expected_check_digit(number[:10]) == int(number[10])
+        assert (
+            sum(
+                reading[position] != number[position]
+                for reading in readings
+                for position in range(CONTAINER_LENGTH)
+            )
+            == cost
+        )
+
+
+def test_consensus_unique_solution_with_duplicates_counted() -> None:
+    # 重复读数重复计票：两条正确读数 + 一条末位抄错读数，唯一共识。
+    result = consensus_container_number([CONS_A, CONS_A, "CSQU3054384"])
+    assert result.minimum_cost == 1
+    assert result.optimal_count == 1
+    assert result.solutions == (CONS_A,)
+    assert result.truncated is False
+    _assert_matches_reference([CONS_A, CONS_A, "CSQU3054384"], result)
+
+
+def test_consensus_global_optimum_defeats_local_majority() -> None:
+    # 局部多数违反校验位：逐位多数拼装为 "CSQU3054389"（第 10 位 8 占 3
+    # 票、末位 9 占 4 票），其校验位不符；即使把末位修补为期望的 3，
+    # 代价也是 6。全局最优反而把第 10 位翻成少数派 9：CSQU3054399，
+    # 代价 4——绝不先逐位取多数再修补末位。
+    readings = [CONS_A, "CSQU3054389", CONS_B, CONS_B, "CSQU3054389"]
+    result = consensus_container_number(readings)
+    assert result.minimum_cost == 4
+    assert result.optimal_count == 1
+    assert result.solutions == (CONS_B,)
+    # 逐位多数拼装号本身校验位不符（前缀余 3，多数末位为 9）。
+    assert expected_check_digit("CSQU305438") == 3
+    assert expected_check_digit("CSQU305439") == 9
+    _assert_matches_reference(readings, result)
+
+
+def test_consensus_over_hundred_tied_optima_truncated_in_lexicographic_order() -> None:
+    # 两条读数在 10 个位置上各持一个合法字符：每个满足校验位的组合代价
+    # 恒为 10 且全部并列最优，最优解总数（独立枚举为 139）超过 100。
+    readings = ["AAAU0000000", "BBBU1111111"]
+    result = consensus_container_number(readings)
+    assert result.minimum_cost == 10
+    assert result.optimal_count == 139 > CONSENSUS_SOLUTION_LIMIT
+    assert len(result.solutions) == CONSENSUS_SOLUTION_LIMIT
+    assert result.truncated is True
+    # 前一百个解按完整箱号字典序，且与独立暴力枚举完全一致。
+    assert list(result.solutions) == sorted(result.solutions)
+    _assert_matches_reference(readings, result)
+
+
+def test_consensus_no_solution_when_position_has_no_legal_observation() -> None:
+    # 第一类无解边界：第 4 位（类别码）全部观测都是非法字符，候选域为空。
+    result = consensus_container_number(["CSQX3054383", "CSQD3054384"])
+    assert result.minimum_cost is None
+    assert result.optimal_count == 0
+    assert result.solutions == ()
+    assert result.truncated is False
+    _assert_matches_reference(["CSQX3054383", "CSQD3054384"], result)
+
+
+def test_consensus_no_solution_when_no_combination_satisfies_check_digit() -> None:
+    # 第二类无解边界：候选域非空，但唯一可行前缀的期望校验位是 3，
+    # 而末位候选域只有 {4, 5}。
+    readings = ["CSQU3054384", "CSQU3054385"]
+    result = consensus_container_number(readings)
+    assert result.minimum_cost is None
+    assert result.optimal_count == 0
+    assert result.solutions == ()
+    assert result.truncated is False
+    _assert_matches_reference(readings, result)
+
+
+def test_consensus_illegal_characters_only_count_as_disagreement() -> None:
+    # 非法字符只计不一致、不进入候选域：小写读数不会把小写带进解里，
+    # 共识仍为大写合法号；位置 1-4 各计 1 次不一致。
+    readings = [CONS_A, "csqu3054383"]
+    result = consensus_container_number(readings)
+    assert result.minimum_cost == 4
+    assert result.optimal_count == 1
+    assert result.solutions == (CONS_A,)
+    _assert_matches_reference(readings, result)
+
+
+def test_consensus_ambiguous_optima_sorted_by_full_number() -> None:
+    # 两个合法号互为一位之差且各一票：两个最优解并列，按字典序返回。
+    result = consensus_container_number([CONS_B, CONS_A])  # 输入乱序不影响解序
+    assert result.minimum_cost == 2
+    assert result.optimal_count == 2
+    assert result.solutions == (CONS_A, CONS_B)  # 字典序，非输入顺序
+    assert result.truncated is False
+    _assert_matches_reference([CONS_B, CONS_A], result)
+
+
+def test_consensus_requires_exact_length_for_every_reading() -> None:
+    for bad in ("CSQU305438", "CSQU30543834", "", " CSQU3054383"):
+        with pytest.raises(ValueError):
+            consensus_container_number([CONS_A, bad])
+
+
+def test_consensus_result_is_immutable() -> None:
+    result = consensus_container_number([CONS_A, CONS_A])
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        result.minimum_cost = 0  # type: ignore[misc]
+
+
+def test_consensus_matches_brute_force_on_random_readings() -> None:
+    # 小字符域随机读数（含非法字符与重复读数）：全局最优代价、精确计数、
+    # 字典序解序列与独立暴力枚举逐字段一致。
+    rng = random.Random(20260915)
+    letter_pool = ["A", "B", "C", "a", "!"]
+    category_pool = ["U", "J", "X", "u"]
+    digit_pool = ["0", "1", "2", "x"]
+    for _ in range(40):
+        readings = [
+            "".join(
+                rng.choice(letter_pool)
+                if position < 3
+                else rng.choice(category_pool)
+                if position == 3
+                else rng.choice(digit_pool)
+                for position in range(CONTAINER_LENGTH)
+            )
+            for _ in range(rng.randint(2, 4))
+        ]
+        _assert_matches_reference(readings, consensus_container_number(readings))

@@ -9,7 +9,10 @@
 权重与乘积的完整计算过程供现场复核。**换班交接**时还可使用一次性清单
 核对入口：当班作业清单（预期）与现场扫描清单各自先通过结构与校验位
 校验，再按完整箱号以重复次数逐次配对，直接给出已匹配项、预期中缺少项
-与现场多出项及其原索引，免去人工逐项比对。
+与现场多出项及其原索引，免去人工逐项比对。**闸口摄像头受雨污遮挡**时，
+同一箱体会产生多份矛盾的识别读数，共识入口接收 2 至 100 条原始读数，
+在校验位约束下用动态规划求全局最优的合法箱号，返回最小代价、最优解
+总数与字典序前一百个解。
 
 - 运行时：Python 3.12、FastAPI、Pydantic v2、Uvicorn
 - 无数据库、无外部依赖；字符映射与加权计算逻辑见 `app/checksum.py`
@@ -450,6 +453,93 @@ curl -s -X POST http://localhost:8000/api/v1/container-numbers/reconcile \
 FastAPI 标准 `{"detail": [...]}`，与上面的业务负载
 `{"status": "invalid_item", ...}` 明确区分。
 
+## 闸口多读数共识（雨污遮挡）
+
+闸口摄像头受雨污遮挡时，同一箱体会被连续拍出多份**互相矛盾**的 11 位
+识别结果。逐位取多数并不安全：多数拼出的箱号可能根本不满足校验位，
+即使再修补末位，得到的也未必是全局最可信的箱号。共识入口对同一箱体的
+**2 至 100 条原始读数**求校验位约束下的**全局最优**合法箱号：
+
+端点：`POST /api/v1/container-numbers/consensus`
+请求体：`{"readings": ["...", "..."]}`，每条读数恰为 11 个字符，原样
+使用，不做大小写或空白归一化（字段缺失、读数非字符串、长度非 11 位、
+数量越界或存在多余字段，均按请求校验返回 422 `detail`）。
+
+### 求解口径
+
+- **候选域**：每个位置取"实际出现且符合该位置字符域"的字符（前 3 位
+  `A-Z`、第 4 位 `U/J/Z`、后 7 位 `0-9`）；非法字符（小写、全角、
+  未配对代理字符等）**只计入不一致数，绝不进入候选域**；
+- **代价**：候选箱号对全部读数的逐位不一致总数，**重复读数重复计票**；
+- **全局最优**：反向动态规划——前 10 位按加权余数（mod 11）做状态
+  转移，第 11 位由余数唯一确定且必须落在候选域中，每个状态记录
+  （最小代价, 达到该代价的完整箱号数）。**绝不**先逐位取多数再修补
+  末位；
+- **无解**：任一位置无合法观测（候选域为空），或候选域中不存在满足
+  校验位的组合，两类边界同口径返回 `no_solution`。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/container-numbers/consensus \
+  -H 'Content-Type: application/json' \
+  -d '{"readings": ["CSQU3054383", "CSQU3054383", "CSQU3054384"]}'
+```
+
+```json
+{
+  "status": "determined",
+  "reading_count": 3,
+  "minimum_cost": 1,
+  "optimal_count": 1,
+  "solutions": ["CSQU3054383"],
+  "truncated": false
+}
+```
+
+`status` 取值：
+
+- `determined`：唯一最优解，可直接采信；
+- `ambiguous`：多个最优解并列，`solutions` 按完整箱号字典序给出
+  前 100 个，`optimal_count` 仍是**精确**的最优解总数；总数超过
+  100 时 `truncated` 为 `true`；
+- `no_solution`：无解，`minimum_cost` 为 `null`，`optimal_count`
+  为 0，`solutions` 为空。
+
+局部多数违反校验位的例子：读数 `CSQU3054383`、`CSQU3054389`、
+`CSQU3054399`、`CSQU3054399`、`CSQU3054389` 的逐位多数拼装号为
+`CSQU3054389`（第 10 位 `8` 占 3 票、末位 `9` 占 4 票），其校验位
+不符；把末位修补为期望的 `3` 得到 `CSQU3054383`，代价 6。全局最优
+反而把第 10 位翻成少数派 `9`：`CSQU3054399`，代价仅 4——动态规划
+在余数状态空间中求得，而非逐位投票。
+
+```json
+{
+  "status": "determined",
+  "reading_count": 5,
+  "minimum_cost": 4,
+  "optimal_count": 1,
+  "solutions": ["CSQU3054399"],
+  "truncated": false
+}
+```
+
+无解示例（类别码位的观测全是非法字符）：
+
+```bash
+curl -s -X POST .../consensus -H 'Content-Type: application/json' \
+  -d '{"readings": ["CSQX3054383", "CSQD3054384"]}'
+```
+
+```json
+{
+  "status": "no_solution",
+  "reading_count": 2,
+  "minimum_cost": null,
+  "optimal_count": 0,
+  "solutions": [],
+  "truncated": false
+}
+```
+
 ## 未配对代理字符
 
 请求体 JSON 的 `\uXXXX` 转义可构造**未配对代理字符**（如首位为
@@ -460,7 +550,9 @@ FastAPI 标准 `{"detail": [...]}`，与上面的业务负载
   位置 1，`error_code=not_uppercase_letter`）；
 - 计算明细：返回相同的 `invalid_container` 首位结构错误；
 - 单箱纠错：恰为 11 位时照常枚举候选并完整返回（位置 1 候选的
-  `original_character` 即该代理字符）。
+  `original_character` 即该代理字符）；
+- 多读数共识：代理字符只计入不一致数，不进入候选域，共识结果照常
+  求解返回。
 
 响应中的原样回显以 `\uXXXX` 转义形式传输，任何标准 JSON 解析器
 都能无损还原原字符串，回显语义与其他非法字符完全一致。
@@ -477,7 +569,11 @@ FastAPI 标准 `{"detail": [...]}`，与上面的业务负载
 "按出现次序对齐"参考逐字段一致、配对数量守恒（配对+缺少=预期总数、
 配对+多出=现场总数、原索引不重不漏），并覆盖完全一致、单侧缺失、
 重复次数不等（三次对两次时仅最后一次入差异）与非法箱号拒绝（来源、
-最小索引、结构/校验位两类原结论）四种场景：
+最小索引、结构/校验位两类原结论）四种场景；共识入口以候选域笛卡尔积
+暴力枚举为独立参考，断言局部多数违反校验位时的全局最优解、超过一百个
+同分最优的精确计数与字典序截断、两类无解边界（位置无合法观测、无满足
+校验位的组合）、唯一共识与重复读数计票、非法字符只计不一致，以及随机
+小字符域读数下代价、计数与解序列的逐字段一致：
 
 ```bash
 .venv/bin/pip install -r requirements-dev.txt
@@ -508,12 +604,12 @@ docker compose --profile acceptance up --build \
 
 ```
 app/
-  checksum.py     # 字符映射、加权和、期望校验位、结构判定、纠错候选、计算明细、箱主汇总、清单核对（独立可测）
+  checksum.py     # 字符映射、加权和、期望校验位、结构判定、纠错候选、计算明细、箱主汇总、清单核对、多读数共识（独立可测）
   schemas.py      # Pydantic 请求/响应模型
-  main.py         # FastAPI 路由：整批结构校验 + 逐项复算 + 可选箱主汇总 + 单箱纠错 + 单箱明细 + 一次性清单核对
+  main.py         # FastAPI 路由：整批结构校验 + 逐项复算 + 可选箱主汇总 + 单箱纠错 + 单箱明细 + 一次性清单核对 + 多读数共识
 tests/
-  test_checksum.py  # 映射跳号、余数边界、清单配对等单元测试
-  test_api.py       # API 端到端测试（含纠错、明细、箱主汇总、清单核对的独立参考断言）
+  test_checksum.py  # 映射跳号、余数边界、清单配对、共识全局最优等单元测试
+  test_api.py       # API 端到端测试（含纠错、明细、箱主汇总、清单核对、共识的独立参考断言）
 scripts/
   acceptance.py     # verify 一次性验收脚本（仅用标准库）
 docker-compose.yml  # 仅 api 常驻；verify 为一次性任务

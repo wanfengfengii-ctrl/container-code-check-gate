@@ -550,3 +550,178 @@ def reconcile_container_numbers(
         missing=tuple(missing),
         extra=tuple(extra),
     )
+
+
+# --------------------------------------------------------------- 闸口多读数共识
+
+#: 共识结果携带的最优解条数上限：最优解总数是候选域上的精确计数，可能
+#: 极大；结果只携带按完整箱号字典序排列的前 CONSENSUS_SOLUTION_LIMIT 个。
+CONSENSUS_SOLUTION_LIMIT = 100
+
+
+@dataclass(frozen=True)
+class ConsensusResult:
+    """同一箱体多条原始读数的共识求解结论（不可变）。
+
+    ``reading_count`` 为参与计票的原始读数条数（重复读数重复计票）。
+    ``minimum_cost`` 为最优解对全部读数的逐位不一致总数；**无解时为
+    ``None``**——任一位置无合法观测（该位置候选域为空），或候选域中
+    不存在满足校验位的组合。``optimal_count`` 为达到最小代价的合法
+    箱号总数（精确计数，可能远大于返回条数；无解时为 0）。
+    ``solutions`` 为按完整箱号字典序排列的前
+    :data:`CONSENSUS_SOLUTION_LIMIT` 个最优解；``truncated`` 表示
+    最优解总数超出返回条数。
+    """
+
+    reading_count: int
+    minimum_cost: int | None
+    optimal_count: int
+    solutions: tuple[str, ...]
+    truncated: bool
+
+
+def consensus_container_number(readings: Sequence[str]) -> ConsensusResult:
+    """对同一箱体的多条原始读数求校验位约束下的全局最优共识箱号。
+
+    求解口径：
+
+    * **候选域**：各位置取“实际出现且符合该位置字符域”的字符（字符域
+      与纠错候选同源，复用 :func:`_allowed_characters`）；非法字符（小写、
+      全角、未配对代理字符等）只计入不一致数，绝不进入候选域；
+    * **代价**：候选箱号对全部读数的逐位不一致总数，重复读数重复计票；
+    * **全局最优**：反向动态规划——前 10 位按加权余数（mod 11）做状态
+      转移，第 11 位由余数唯一确定且必须落在候选域中；每个状态记录
+      （最小代价, 达到该代价的完整箱号数）。**绝不**先逐位取多数再修补
+      末位：局部多数拼装号可能违反校验位，即使修补合法也未必全局最优；
+    * **无解**：任一位置无合法观测，或候选域中不存在满足校验位的组合；
+      两类边界同口径，``minimum_cost`` 为 None、``optimal_count`` 为 0。
+
+    输入每条必须恰为 11 位（契约层按请求校验保证；直接调用违反时抛出
+    ValueError）；不做任何大小写或空白归一化。读数条数上下限（2..100）
+    由契约层保证，领域层不限制。
+    """
+    for reading in readings:
+        if len(reading) != CONTAINER_LENGTH:
+            raise ValueError(
+                f"each reading must be exactly {CONTAINER_LENGTH} "
+                f"characters, got {len(reading)}"
+            )
+
+    # 逐位置候选域与不一致计票：候选为“实际出现 ∩ 字符域”，按码位升序
+    # 固定枚举顺序（精确计数与字典序枚举的确定性都依赖该顺序）。
+    candidates: list[list[str]] = []
+    disagreement: list[dict[str, int]] = []
+    for position in range(CONTAINER_LENGTH):
+        domain = set(_allowed_characters(position))
+        observed = {reading[position] for reading in readings}
+        legal = sorted(observed & domain)
+        candidates.append(legal)
+        disagreement.append(
+            {
+                char: sum(
+                    1 for reading in readings if reading[position] != char
+                )
+                for char in legal
+            }
+        )
+
+    # 反向 DP：suffix[position][remainder] = (最小附加代价, 方案数)，表示
+    # 前 position 位加权余数为 remainder 时，完成第 position..10 位且满足
+    # 校验位约束的全局最优；None 表示该状态不可行。终止层（第 11 位）：
+    # 余数唯一确定期望校验位，且必须落在候选域中。
+    suffix: list[list[tuple[int, int] | None]] = [
+        [None] * MODULUS for _ in range(CONTAINER_LENGTH)
+    ]
+    terminal = suffix[CONTAINER_LENGTH - 1]
+    for remainder in range(MODULUS):
+        digit = str(_check_digit_from_remainder(remainder))
+        if digit in disagreement[CONTAINER_LENGTH - 1]:
+            terminal[remainder] = (
+                disagreement[CONTAINER_LENGTH - 1][digit],
+                1,
+            )
+    for position in range(CONTAINER_LENGTH - 2, -1, -1):
+        weight = 2 ** position
+        layer = suffix[position]
+        following = suffix[position + 1]
+        for remainder in range(MODULUS):
+            best_cost: int | None = None
+            best_count = 0
+            for char in candidates[position]:
+                nxt = (remainder + character_value(char) * weight) % MODULUS
+                sub = following[nxt]
+                if sub is None:
+                    continue
+                cost = disagreement[position][char] + sub[0]
+                if best_cost is None or cost < best_cost:
+                    best_cost = cost
+                    best_count = sub[1]
+                elif cost == best_cost:
+                    best_count += sub[1]
+            if best_cost is not None:
+                layer[remainder] = (best_cost, best_count)
+
+    root = suffix[0][0]
+    if root is None:
+        # 两类无解边界同口径：候选域为空的位置使 DP 天然不可行；候选域
+        # 非空但无任何组合满足校验位时，终止层全部不可达。
+        return ConsensusResult(
+            reading_count=len(readings),
+            minimum_cost=None,
+            optimal_count=0,
+            solutions=(),
+            truncated=False,
+        )
+
+    minimum_cost, optimal_count = root
+    solutions = tuple(
+        _enumerate_consensus_solutions(
+            candidates, disagreement, suffix, CONSENSUS_SOLUTION_LIMIT
+        )
+    )
+    return ConsensusResult(
+        reading_count=len(readings),
+        minimum_cost=minimum_cost,
+        optimal_count=optimal_count,
+        solutions=solutions,
+        truncated=optimal_count > len(solutions),
+    )
+
+
+def _enumerate_consensus_solutions(
+    candidates: list[list[str]],
+    disagreement: list[dict[str, int]],
+    suffix: list[list[tuple[int, int] | None]],
+    limit: int,
+) -> list[str]:
+    """按完整箱号字典序枚举前 ``limit`` 个最优解（回溯反向 DP 表）。
+
+    从（位置 0, 余数 0）出发，逐位置按码位升序尝试候选字符，只沿
+    “仍能达到全局最小代价”的分支深入；第 11 位由余数唯一确定。
+    候选列表已按码位升序，故枚举顺序即完整箱号的字典序。
+    """
+
+    def walk(position: int, remainder: int, remaining: int) -> list[str]:
+        if remaining == 0:
+            return []
+        if position == CONTAINER_LENGTH - 1:
+            # 可行性由父分支保证：该余数的期望校验位必在候选域中。
+            return [str(_check_digit_from_remainder(remainder))]
+        state = suffix[position][remainder]
+        assert state is not None  # 只沿可行分支深入
+        budget = state[0]
+        found: list[str] = []
+        for char in candidates[position]:
+            nxt = (remainder + character_value(char) * (2**position)) % MODULUS
+            sub = suffix[position + 1][nxt]
+            if sub is None:
+                continue
+            if disagreement[position][char] + sub[0] != budget:
+                continue  # 该字符不在任何全局最优路径上
+            for tail in walk(position + 1, nxt, remaining - len(found)):
+                found.append(char + tail)
+            if len(found) >= remaining:
+                break
+        return found
+
+    return walk(0, 0, limit)
